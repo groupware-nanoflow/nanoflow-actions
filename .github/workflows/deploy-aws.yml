@@ -1,0 +1,150 @@
+# Workflow reutilizable de NanoFlow: despliega el repositorio en la cuenta AWS
+# del ambiente al que corresponde la rama.
+#
+# El repositorio del cliente no copia estos pasos, los invoca. Así el pipeline
+# se corrige y se mejora para todos los proyectos con una release de este repo,
+# en vez de con un PR en cada uno.
+name: NanoFlow deploy to AWS
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: Base del API de NanoFlow.
+        required: true
+        type: string
+      audience:
+        description: Audiencia OIDC, p. ej. nanoflow-dev.
+        required: true
+        type: string
+      manifest:
+        description: Manifiesto de despliegue del repositorio.
+        required: false
+        type: string
+        default: .nanoflow/deploy.yml
+      working-directory:
+        description: Directorio desde el que se ejecutan build y deploy.
+        required: false
+        type: string
+        default: .
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      # Lo mínimo: leer el código y poder pedir el token OIDC. En particular NO
+      # se pide `contents: write`: un despliegue no reescribe el repositorio.
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Leer el manifiesto
+        id: manifest
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::No existe $MANIFEST. NanoFlow lo crea al registrar el repositorio; si lo borraste, vuelve a generarlo desde la consola."
+            exit 1
+          fi
+          if ! command -v yq >/dev/null 2>&1; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+          {
+            echo "node=$(yq -r '.toolchain.node // ""' "$MANIFEST")"
+            echo "go=$(yq -r '.toolchain.go // ""' "$MANIFEST")"
+            echo "python=$(yq -r '.toolchain.python // ""' "$MANIFEST")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Credenciales del ambiente
+        id: aws
+        uses: groupware-nanoflow/nanoflow-actions/actions/aws-credentials@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+
+      - name: Resolver los comandos del ambiente
+        id: commands
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          ENVIRONMENT: ${{ steps.aws.outputs.environment }}
+        run: |
+          set -euo pipefail
+          # Un ambiente puede sobrescribir build y deploy; si no lo hace, hereda
+          # los de la raíz. Se resuelve DESPUÉS de saber el ambiente, porque el
+          # ambiente lo decide NanoFlow y no el manifiesto.
+          build=$(yq -r ".environments.${ENVIRONMENT}.build // .build // \"\"" "$MANIFEST")
+          deploy=$(yq -r ".environments.${ENVIRONMENT}.deploy // .deploy // \"\"" "$MANIFEST")
+          if [ -z "$deploy" ]; then
+            echo "::error::El manifiesto no define 'deploy' ni para el ambiente ${ENVIRONMENT} ni en la raíz."
+            exit 1
+          fi
+          {
+            echo "build<<__NF__"; echo "$build"; echo "__NF__"
+            echo "deploy<<__NF__"; echo "$deploy"; echo "__NF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        if: steps.manifest.outputs.node != ''
+        with:
+          node-version: ${{ steps.manifest.outputs.node }}
+
+      - uses: actions/setup-go@v5
+        if: steps.manifest.outputs.go != ''
+        with:
+          go-version: ${{ steps.manifest.outputs.go }}
+
+      - uses: actions/setup-python@v5
+        if: steps.manifest.outputs.python != ''
+        with:
+          python-version: ${{ steps.manifest.outputs.python }}
+
+      # Los comandos del manifiesto se pasan por variable de entorno y se
+      # ejecutan desde un archivo, no interpolados dentro del `run`. Interpolar
+      # rompe con cualquier comilla y convierte el manifiesto en parte del
+      # script del workflow; así es solo lo que dice ser: un script.
+      - name: Build
+        if: steps.commands.outputs.build != ''
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+        env:
+          NF_BUILD: ${{ steps.commands.outputs.build }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$NF_BUILD" > "$RUNNER_TEMP/nf-build.sh"
+          bash -euo pipefail "$RUNNER_TEMP/nf-build.sh"
+
+      - name: Deploy
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+        env:
+          NF_DEPLOY: ${{ steps.commands.outputs.deploy }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$NF_DEPLOY" > "$RUNNER_TEMP/nf-deploy.sh"
+          bash -euo pipefail "$RUNNER_TEMP/nf-deploy.sh"
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Despliegue NanoFlow"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Ambiente | ${{ steps.aws.outputs.environment }} |"
+            echo "| Cuenta AWS | ${{ steps.aws.outputs.account-id }} |"
+            echo "| Región | ${{ steps.aws.outputs.region }} |"
+            echo "| Rama | ${GITHUB_REF_NAME} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+          } >> "$GITHUB_STEP_SUMMARY"
