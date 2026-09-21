@@ -1,0 +1,25 @@
+# .nanoflow/deploy.yml — cómo se construye y se despliega este repositorio.
+#
+# NanoFlow aporta la identidad (credenciales temporales en la cuenta AWS del
+# ambiente) y la trazabilidad. Cómo se despliega lo decide el proyecto, porque
+# el agente genera aplicaciones reales y no tres plantillas fijas.
+version: 1
+
+toolchain:
+  node: "22"
+  # go: "1.25"
+  # python: "3.12"
+
+build: pnpm install --frozen-lockfile && pnpm build
+
+deploy: |
+  terraform init -input=false
+  terraform apply -auto-approve
+
+# Opcional: un ambiente puede sobrescribir cualquiera de los dos. Se resuelve
+# después de que NanoFlow decide el ambiente a partir de la rama.
+environments:
+  production:
+    deploy: |
+      terraform init -input=false
+      terraform apply -auto-approve -var-file=prod.tfvars

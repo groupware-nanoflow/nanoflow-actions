@@ -1,0 +1,23 @@
+# Este es el archivo que NanoFlow escribe en el repositorio del cliente, en
+# .github/workflows/deploy.yml. Son veinte líneas porque todo lo demás vive en
+# el workflow reutilizable.
+name: Deploy
+
+on:
+  push:
+    branches: [develop, stage, main]
+  workflow_dispatch:
+
+# Dos despliegues seguidos sobre la misma rama se encolan en vez de pisarse.
+# Sin cancel-in-progress: cortar un apply a la mitad deja infraestructura en un
+# estado que nadie eligió.
+concurrency:
+  group: nanoflow-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/deploy-aws.yml@v1
+    with:
+      api-url: https://devapi-nanoflow.groupware.com.co
+      audience: nanoflow-dev

@@ -1,0 +1,103 @@
+name: NanoFlow AWS credentials
+description: >
+  Cambia el token OIDC del job por credenciales temporales de AWS en la cuenta
+  del ambiente al que despliega esta rama. El job NO elige el ambiente: lo
+  deriva NanoFlow de la rama, que viene firmada por GitHub dentro del token.
+
+inputs:
+  api-url:
+    description: Base del API de NanoFlow, p. ej. https://devapi-nanoflow.groupware.com.co
+    required: true
+  audience:
+    description: Audiencia que se le pide a GitHub, p. ej. nanoflow-dev. Sin valor por defecto a propósito.
+    required: true
+
+outputs:
+  account-id:
+    description: Cuenta AWS en la que quedaron las credenciales
+    value: ${{ steps.exchange.outputs.account-id }}
+  environment:
+    description: Ambiente que NanoFlow resolvió para esta rama
+    value: ${{ steps.exchange.outputs.environment }}
+  region:
+    description: Región del ambiente
+    value: ${{ steps.exchange.outputs.region }}
+
+runs:
+  using: composite
+  steps:
+    - id: exchange
+      shell: bash
+      env:
+        NF_API_URL: ${{ inputs.api-url }}
+        NF_AUDIENCE: ${{ inputs.audience }}
+      run: |
+        set -euo pipefail
+
+        # id-token: write es lo que hace existir estas dos variables. Sin ellas
+        # el job no puede probar quién es, y el mensaje por defecto de curl no
+        # ayuda nada a entender por qué.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::Este job no tiene 'permissions: id-token: write', así que no puede pedir su token OIDC."
+          exit 1
+        fi
+
+        oidc=$(curl -sS --fail-with-body \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value')
+        if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+          echo "::error::GitHub no devolvió un token OIDC para la audiencia ${NF_AUDIENCE}."
+          exit 1
+        fi
+
+        body=$(mktemp)
+        trap 'rm -f "$body"' EXIT
+        code=$(curl -sS -o "$body" -w '%{http_code}' -X POST \
+          "${NF_API_URL%/}/v1/ci/aws-session" \
+          -H "Authorization: Bearer ${oidc}" \
+          -H 'Accept: application/json')
+
+        if [ "$code" != "200" ]; then
+          # El endpoint explica el rechazo en 'message': rama sin ambiente,
+          # ambiente que exige aprobación en la consola, repositorio no
+          # registrado. Merece llegar tal cual al log.
+          echo "::error::NanoFlow no entregó credenciales (HTTP ${code}): $(jq -r '.message // "sin detalle"' "$body")"
+          exit 1
+        fi
+
+        # Las credenciales llegan por HTTP, así que GitHub no las conoce y no
+        # las oculta por su cuenta. Enmascararlas ANTES de exportarlas.
+        for key in accessKeyId secretAccessKey sessionToken; do
+          echo "::add-mask::$(jq -r ".${key}" "$body")"
+        done
+
+        {
+          echo "AWS_ACCESS_KEY_ID=$(jq -r '.accessKeyId' "$body")"
+          echo "AWS_SECRET_ACCESS_KEY=$(jq -r '.secretAccessKey' "$body")"
+          echo "AWS_SESSION_TOKEN=$(jq -r '.sessionToken' "$body")"
+          echo "AWS_REGION=$(jq -r '.region' "$body")"
+          echo "AWS_DEFAULT_REGION=$(jq -r '.region' "$body")"
+        } >> "$GITHUB_ENV"
+
+        {
+          echo "account-id=$(jq -r '.accountId' "$body")"
+          echo "environment=$(jq -r '.environment' "$body")"
+          echo "region=$(jq -r '.region' "$body")"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "Ambiente $(jq -r '.environment' "$body") · cuenta $(jq -r '.accountId' "$body") · expira $(jq -r '.expiration' "$body")"
+
+    - name: Confirmar la identidad en AWS
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Antes de crear nada: comprobar que las credenciales aterrizaron donde
+        # se creía. Una cuenta distinta a la esperada se detecta aquí, no a
+        # mitad de un apply.
+        got=$(aws sts get-caller-identity --query Account --output text)
+        want='${{ steps.exchange.outputs.account-id }}'
+        if [ "$got" != "$want" ]; then
+          echo "::error::Las credenciales son de la cuenta ${got} y NanoFlow dijo ${want}."
+          exit 1
+        fi
+        echo "Autenticado en la cuenta ${got}."
