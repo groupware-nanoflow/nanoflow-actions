@@ -1,0 +1,117 @@
+name: NanoFlow report deployment
+description: >
+  Informa a NanoFlow el inicio o el resultado del despliegue de este run. El
+  ambiente no se manda: NanoFlow lo deriva de la rama firmada en el token OIDC,
+  igual que las credenciales. Nunca falla el job: si NanoFlow no responde, deja
+  un aviso y sigue.
+
+inputs:
+  api-url:
+    description: Base del API de NanoFlow, p. ej. https://devapi-nanoflow.groupware.com.co
+    required: true
+  audience:
+    description: Audiencia que se le pide a GitHub, p. ej. nanoflow-dev. La misma que la de las credenciales.
+    required: true
+  status:
+    description: in_progress | success | failure | cancelled
+    required: true
+  environment-url:
+    description: URL pública de lo desplegado, si la hay.
+    required: false
+    default: ''
+  error:
+    description: "Motivo corto del fallo, p. ej. deploy: exit 1."
+    required: false
+    default: ''
+
+outputs:
+  deployment-id:
+    description: Id del despliegue en NanoFlow (vacío si no se pudo informar)
+    value: ${{ steps.report.outputs.deployment-id }}
+  environment:
+    description: Ambiente que NanoFlow resolvió para esta rama
+    value: ${{ steps.report.outputs.environment }}
+
+runs:
+  using: composite
+  steps:
+    - id: report
+      shell: bash
+      env:
+        NF_API_URL: ${{ inputs.api-url }}
+        NF_AUDIENCE: ${{ inputs.audience }}
+        NF_STATUS: ${{ inputs.status }}
+        NF_ENVIRONMENT_URL: ${{ inputs.environment-url }}
+        NF_ERROR: ${{ inputs.error }}
+      run: |
+        # Sin `set -e` a propósito: este paso informa, no decide. Cualquier fallo
+        # termina en un ::warning:: y en exit 0.
+        set -uo pipefail
+
+        report() {
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "el job no tiene 'permissions: id-token: write'"
+            return 1
+          fi
+          case "$NF_STATUS" in
+            in_progress|success|failure|cancelled) ;;
+            *) echo "estado desconocido '${NF_STATUS}'"; return 1 ;;
+          esac
+
+          local oidc body code payload
+          oidc=$(curl -sS --fail --max-time 10 --retry 2 --retry-connrefused \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value') || true
+          if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+            echo "GitHub no devolvió un token OIDC para la audiencia ${NF_AUDIENCE}"
+            return 1
+          fi
+
+          # jq arma el JSON: el error y la URL vienen del manifiesto y de la
+          # salida de un comando, y pueden traer comillas o saltos de línea.
+          payload=$(jq -nc \
+            --arg status "$NF_STATUS" \
+            --arg url "$NF_ENVIRONMENT_URL" \
+            --arg error "$NF_ERROR" \
+            '{status: $status}
+             + (if $url   != "" then {environmentUrl: $url} else {} end)
+             + (if $error != "" then {error: ($error | .[0:1000])} else {} end)') || {
+            echo "no se pudo armar el cuerpo"
+            return 1
+          }
+
+          body=$(mktemp)
+          code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 --retry 2 --retry-connrefused \
+            -X POST "${NF_API_URL%/}/v1/ci/deployments" \
+            -H "Authorization: Bearer ${oidc}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' \
+            --data "$payload") || code="000"
+
+          if [ "$code" = "000" ]; then
+            echo "NanoFlow no respondió"
+            rm -f "$body"
+            return 1
+          fi
+          if [ "$code" != "200" ]; then
+            # El endpoint explica el rechazo en 'message': rama sin ambiente,
+            # despliegue que ya terminó con otro estado.
+            echo "HTTP ${code}: $(jq -r '.message // "sin detalle"' "$body" 2>/dev/null || echo 'sin detalle')"
+            rm -f "$body"
+            return 1
+          fi
+
+          {
+            echo "deployment-id=$(jq -r '.deploymentId // ""' "$body")"
+            echo "environment=$(jq -r '.environment // ""' "$body")"
+          } >> "$GITHUB_OUTPUT"
+          echo "NanoFlow: despliegue $(jq -r '.status' "$body") en $(jq -r '.environment' "$body")."
+          rm -f "$body"
+        }
+
+        if ! msg=$(report 2>&1); then
+          echo "::warning::NanoFlow no registró el despliegue (${NF_STATUS}): ${msg##*$'\n'}"
+        else
+          echo "$msg"
+        fi
+        exit 0

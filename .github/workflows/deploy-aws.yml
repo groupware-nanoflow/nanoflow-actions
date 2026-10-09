@@ -31,6 +31,11 @@ on:
         required: false
         type: string
         default: ubuntu-latest
+      live-logs:
+        description: Reenviar a NanoFlow, en vivo, la salida de build y deploy.
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   deploy:
@@ -38,6 +43,9 @@ jobs:
     permissions:
       # Lo mínimo: leer el código y poder pedir el token OIDC. En particular NO
       # se pide `contents: write`: un despliegue no reescribe el repositorio.
+      # El mismo token OIDC autentica las credenciales, el log en vivo y el
+      # reporte del despliegue. El job que llama tiene que conceder id-token:
+      # write: un workflow reutilizable no puede pedir más de lo que recibe.
       contents: read
       id-token: write
     steps:
@@ -88,10 +96,45 @@ jobs:
             echo "::error::El manifiesto no define 'deploy' ni para el ambiente ${ENVIRONMENT} ni en la raíz."
             exit 1
           fi
+          # La URL de lo desplegado, si el manifiesto la declara: la del ambiente
+          # o la de la raíz. Solo se informa si el despliegue sale bien.
+          url=$(yq -r ".environments.${ENVIRONMENT}.url // .url // \"\"" "$MANIFEST" | head -n 1)
+          # mask-env: variables del entorno de los pasos cuyos valores el log en
+          # vivo tapa antes de enviarlos. Lista o texto separado por comas, en la
+          # raíz y por ambiente; se juntan las dos. Solo nombres de variable.
+          mask_env=$(
+            for key in '.["mask-env"]' ".environments.${ENVIRONMENT}[\"mask-env\"]"; do
+              case "$(yq -r "${key} | tag" "$MANIFEST")" in
+                '!!seq') yq -r "${key}[]" "$MANIFEST" ;;
+                '!!str') yq -r "${key}" "$MANIFEST" | tr ', ' '\n\n' ;;
+              esac
+            done | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u | paste -sd, - || true
+          )
           {
             echo "build<<__NF__"; echo "$build"; echo "__NF__"
             echo "deploy<<__NF__"; echo "$deploy"; echo "__NF__"
+            echo "url=${url}"
+            echo "mask-env=${mask_env}"
           } >> "$GITHUB_OUTPUT"
+
+      # El log en vivo: GitHub no expone el de un job mientras corre, así que
+      # build y deploy pasan su salida por log-stream, que la sigue imprimiendo
+      # aquí y la reenvía a NanoFlow. Con live-logs: false queda en solo-eco.
+      - name: Preparar el log en vivo
+        uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          check-run-id: ${{ job.check_run_id }}
+          mask-env: ${{ steps.commands.outputs.mask-env }}
+          enabled: ${{ inputs.live-logs }}
+
+      - name: Informar el inicio del despliegue
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-deployment@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          status: in_progress
 
       - uses: actions/setup-node@v4
         if: steps.manifest.outputs.node != ''
@@ -112,7 +155,12 @@ jobs:
       # ejecutan desde un archivo, no interpolados dentro del `run`. Interpolar
       # rompe con cualquier comilla y convierte el manifiesto en parte del
       # script del workflow; así es solo lo que dice ser: un script.
+      #
+      # La salida pasa por log-stream. Con pipefail el código de salida es el
+      # del script (log-stream sale siempre con 0), y se guarda para el reporte.
+      # Sin node o con el log en vivo apagado, el script corre solo.
       - name: Build
+        id: build
         if: steps.commands.outputs.build != ''
         working-directory: ${{ inputs.working-directory }}
         shell: bash
@@ -120,18 +168,85 @@ jobs:
           NF_BUILD: ${{ steps.commands.outputs.build }}
         run: |
           set -euo pipefail
-          printf '%s\n' "$NF_BUILD" > "$RUNNER_TEMP/nf-build.sh"
-          bash -euo pipefail "$RUNNER_TEMP/nf-build.sh"
+          script="$RUNNER_TEMP/nf-build.sh"
+          printf '%s\n' "$NF_BUILD" > "$script"
+          set +e
+          if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ] && command -v node >/dev/null 2>&1; then
+            set -o pipefail; bash -euo pipefail "$script" 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step build
+          else
+            bash -euo pipefail "$script"
+          fi
+          rc=$?
+          echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Deploy
+        id: deploy
         working-directory: ${{ inputs.working-directory }}
         shell: bash
         env:
           NF_DEPLOY: ${{ steps.commands.outputs.deploy }}
         run: |
           set -euo pipefail
-          printf '%s\n' "$NF_DEPLOY" > "$RUNNER_TEMP/nf-deploy.sh"
-          bash -euo pipefail "$RUNNER_TEMP/nf-deploy.sh"
+          script="$RUNNER_TEMP/nf-deploy.sh"
+          printf '%s\n' "$NF_DEPLOY" > "$script"
+          set +e
+          if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ] && command -v node >/dev/null 2>&1; then
+            set -o pipefail; bash -euo pipefail "$script" 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step deploy
+          else
+            bash -euo pipefail "$script"
+          fi
+          rc=$?
+          echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      # El resultado, pase lo que pase: si el job falla o se cancela también se
+      # informa. Solo si hubo credenciales, porque sin ellas no hubo despliegue
+      # (y NanoFlow respondería que la rama no despliega en ningún ambiente).
+      - name: Resolver el resultado del despliegue
+        id: result
+        if: always() && steps.aws.outcome == 'success'
+        shell: bash
+        env:
+          JOB_STATUS: ${{ job.status }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          BUILD_EXIT: ${{ steps.build.outputs.exit-code }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          DEPLOY_EXIT: ${{ steps.deploy.outputs.exit-code }}
+          URL: ${{ steps.commands.outputs.url }}
+        run: |
+          case "$JOB_STATUS" in
+            success) status=success ;;
+            cancelled) status=cancelled ;;
+            *) status=failure ;;
+          esac
+          error=''
+          if [ "$status" = "failure" ]; then
+            if [ "$BUILD_OUTCOME" = "failure" ]; then
+              error="build: exit ${BUILD_EXIT:-?}"
+            elif [ "$DEPLOY_OUTCOME" = "failure" ]; then
+              error="deploy: exit ${DEPLOY_EXIT:-?}"
+            else
+              error="el job falló antes del despliegue"
+            fi
+          fi
+          url=''
+          [ "$status" = "success" ] && url="$URL"
+          {
+            echo "status=${status}"
+            echo "error=${error}"
+            echo "url=${url}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Informar el resultado del despliegue
+        if: always() && steps.result.outcome == 'success'
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-deployment@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          status: ${{ steps.result.outputs.status }}
+          environment-url: ${{ steps.result.outputs.url }}
+          error: ${{ steps.result.outputs.error }}
 
       - name: Resumen
         if: always()

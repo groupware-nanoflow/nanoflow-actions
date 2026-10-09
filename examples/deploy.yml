@@ -17,7 +17,15 @@ concurrency:
 
 jobs:
   deploy:
+    # Obligatorio. id-token: write deja al job pedir su token OIDC, con el que
+    # NanoFlow entrega las credenciales, recibe el log en vivo y registra el
+    # despliegue. Un workflow reutilizable solo puede usar los permisos que le
+    # concede quien lo llama: sin esta línea, falla antes de empezar.
+    permissions:
+      contents: read
+      id-token: write
     uses: groupware-nanoflow/nanoflow-actions/.github/workflows/deploy-aws.yml@v1
     with:
       api-url: https://devapi-nanoflow.groupware.com.co
       audience: nanoflow-dev
+      # live-logs: false   # para no reenviar la salida de build y deploy
