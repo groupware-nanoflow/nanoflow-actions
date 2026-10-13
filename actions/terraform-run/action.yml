@@ -1,0 +1,28 @@
+name: NanoFlow terraform run
+description: >
+  Corre un comando (terraform) con su salida en vivo en GitHub y en NanoFlow
+  (log-stream, si el job lo preparó), sin atar el fin del paso a una tubería:
+  si un proceso hijo del comando queda vivo con la salida heredada, el paso
+  termina igual cuando termina el comando. Sin stdin y con TF_INPUT=0.
+
+inputs:
+  command:
+    description: Comando a ejecutar (bash).
+    required: true
+  step:
+    description: Nombre del paso para el log en vivo (init, plan, apply…).
+    required: true
+  working-directory:
+    description: Directorio desde el que se ejecuta.
+    required: false
+    default: .
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        NF_CMD: ${{ inputs.command }}
+        NF_STEP: ${{ inputs.step }}
+      run: '"$GITHUB_ACTION_PATH/run.sh"'

@@ -48,6 +48,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     # El que llama concede estos permisos; un workflow reutilizable no puede
     # pedir más. pull-requests: write es solo para el comentario.
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
@@ -96,19 +97,12 @@ jobs:
       - name: Init y validate
         id: init
         if: steps.env.outputs.found == 'true'
-        working-directory: ${{ steps.env.outputs.dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          run() {
-            if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ]; then
-              "$@" 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step init
-            else
-              "$@"
-            fi
-          }
-          run terraform init -input=false -lock-timeout=5m
-          run terraform validate -no-color
+        timeout-minutes: 10
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: init
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform init -input=false -lock-timeout=5m && terraform validate -no-color
 
       - uses: terraform-linters/setup-tflint@v4
         if: steps.env.outputs.found == 'true'
@@ -149,16 +143,12 @@ jobs:
       - name: Plan
         id: plan
         if: steps.env.outputs.found == 'true' && steps.init.outcome == 'success'
-        working-directory: ${{ steps.env.outputs.dir }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ]; then
-            terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step plan
-          else
-            terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan
-          fi
-          terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+        timeout-minutes: 20
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: plan
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
 
       - name: Informar el plan
         id: report

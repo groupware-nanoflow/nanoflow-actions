@@ -214,6 +214,11 @@ jobs:
 - trivy se descarga de su release y se verifica contra los checksums
   publicados; no se usan acciones de terceros para eso.
 - `report-plan` nunca falla el job: si NanoFlow no responde, deja un aviso.
+- Cada fase de Terraform (`init`, `plan`, `apply`) es un paso propio con
+  `timeout-minutes`, y corre con la acción `terraform-run`: el comando escribe a
+  un archivo que se sigue en vivo, en vez de `terraform … | node log-stream`.
+  Con la tubería, un proceso hijo de Terraform que quedara vivo con la salida
+  heredada impedía que el paso terminara aunque Terraform ya hubiera acabado.
 
 Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js`.
 
