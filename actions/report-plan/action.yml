@@ -1,0 +1,154 @@
+name: NanoFlow report plan
+description: >
+  Resume un plan de Terraform (y el escaneo de trivy, si lo hay), lo informa a
+  NanoFlow (POST /v1/ci/plans) con el token OIDC del job y deja el comentario
+  del PR listo en un archivo. Nunca falla el job: si NanoFlow no responde, deja
+  un aviso y sigue.
+
+inputs:
+  api-url:
+    description: Base del API de NanoFlow, p. ej. https://devapi-nanoflow.groupware.com.co
+    required: true
+  audience:
+    description: Audiencia OIDC, p. ej. nanoflow-dev. La misma que la de las credenciales.
+    required: true
+  environment:
+    description: Ambiente del plan (NanoFlow lo verifica contra la rama firmada en el token).
+    required: true
+  status:
+    description: succeeded | failed
+    required: true
+  plan-json:
+    description: Salida de `terraform show -json tfplan` (vacío si el plan no llegó a existir).
+    required: false
+    default: ''
+  trivy-json:
+    description: Reporte JSON de `trivy config` (opcional).
+    required: false
+    default: ''
+  pr-number:
+    description: Número del PR, si el plan es de un PR.
+    required: false
+    default: ''
+  head-sha:
+    description: Commit planeado. En un PR, la cabeza del PR (GITHUB_SHA es el merge de prueba).
+    required: false
+    default: ''
+
+outputs:
+  summary-file:
+    description: JSON con {create, update, delete, replace, by_type[]}
+    value: ${{ steps.summarize.outputs.summary-file }}
+  comment-file:
+    description: Markdown del comentario del PR (empieza con el marcador del ambiente)
+    value: ${{ steps.summarize.outputs.comment-file }}
+  has-changes:
+    description: "'true' si el plan crea, cambia, reemplaza o destruye algo"
+    value: ${{ steps.summarize.outputs.has-changes }}
+
+runs:
+  using: composite
+  steps:
+    - id: summarize
+      shell: bash
+      env:
+        NF_PLAN: ${{ inputs.plan-json }}
+        NF_TRIVY: ${{ inputs.trivy-json }}
+        NF_ENV: ${{ inputs.environment }}
+        NF_STATUS: ${{ inputs.status }}
+        NF_SCRIPT: ${{ github.action_path }}/summarize.js
+        NF_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/nf-plan"
+        mkdir -p "$dir"
+        args=("$NF_PLAN" --env "$NF_ENV" --status "$NF_STATUS" --run-url "$NF_RUN_URL"
+              --summary "$dir/summary.json" --markdown "$dir/comment.md")
+        if [ -n "$NF_TRIVY" ] && [ -f "$NF_TRIVY" ]; then
+          args+=(--trivy "$NF_TRIVY" --findings "$dir/findings.json")
+        fi
+        counts=$(node "$NF_SCRIPT" "${args[@]}")
+        echo "$counts"
+        changes=false
+        [ "$counts" != "create=0 update=0 replace=0 delete=0" ] && changes=true
+        {
+          echo "summary-file=$dir/summary.json"
+          echo "comment-file=$dir/comment.md"
+          echo "has-changes=$changes"
+        } >> "$GITHUB_OUTPUT"
+
+    - id: report
+      shell: bash
+      env:
+        NF_API_URL: ${{ inputs.api-url }}
+        NF_AUDIENCE: ${{ inputs.audience }}
+        NF_ENV: ${{ inputs.environment }}
+        NF_STATUS: ${{ inputs.status }}
+        NF_PLAN: ${{ inputs.plan-json }}
+        NF_PR: ${{ inputs.pr-number }}
+        NF_HEAD_SHA: ${{ inputs.head-sha }}
+        NF_DIR: ${{ runner.temp }}/nf-plan
+      run: |
+        # Sin `set -e` a propósito: este paso informa, no decide.
+        set -uo pipefail
+
+        report() {
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "el job no tiene 'permissions: id-token: write'"
+            return 1
+          fi
+          case "$NF_STATUS" in succeeded|failed) ;; *) echo "estado desconocido '${NF_STATUS}'"; return 1 ;; esac
+
+          local oidc payload body code plan_b64=''
+          oidc=$(curl -sS --fail --max-time 10 --retry 2 --retry-connrefused \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value') || true
+          if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+            echo "GitHub no devolvió un token OIDC para la audiencia ${NF_AUDIENCE}"
+            return 1
+          fi
+
+          # El plan completo viaja comprimido si cabe (≤ 4 MiB en base64); si
+          # no, solo el resumen. NanoFlow lo guarda en S3.
+          if [ -n "$NF_PLAN" ] && [ -f "$NF_PLAN" ]; then
+            gzip -c "$NF_PLAN" | base64 -w0 > "$NF_DIR/plan.gz.b64"
+            [ "$(stat -c %s "$NF_DIR/plan.gz.b64")" -le 4194304 ] && plan_b64="$NF_DIR/plan.gz.b64"
+          fi
+
+          payload="$NF_DIR/payload.json"
+          jq -n \
+            --arg env "$NF_ENV" --arg status "$NF_STATUS" --arg pr "$NF_PR" \
+            --arg sha "${NF_HEAD_SHA:-$GITHUB_SHA}" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --slurpfile summary "$NF_DIR/summary.json" \
+            --rawfile plan "${plan_b64:-/dev/null}" \
+            --argjson findings "$( [ -f "$NF_DIR/findings.json" ] && cat "$NF_DIR/findings.json" || echo null)" \
+            '{environment: $env, status: $status, headSha: $sha,
+              runId: ($run | tonumber), runAttempt: ($attempt | tonumber),
+              summary: $summary[0]}
+             + (if $pr != "" then {prNumber: ($pr | tonumber)} else {} end)
+             + (if $findings != null then {findings: $findings} else {} end)
+             + (if $plan != "" then {planGzipBase64: $plan} else {} end)' > "$payload" || {
+            echo "no se pudo armar el cuerpo"
+            return 1
+          }
+
+          body=$(mktemp)
+          code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 --retry 2 --retry-connrefused \
+            -X POST "${NF_API_URL%/}/v1/ci/plans" \
+            -H "Authorization: Bearer ${oidc}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' \
+            --data-binary "@$payload") || code="000"
+          case "$code" in
+            000) echo "NanoFlow no respondió"; rm -f "$body"; return 1 ;;
+            200|201) echo "NanoFlow: plan registrado ($(jq -r '.planId // "sin id"' "$body"))."; rm -f "$body" ;;
+            *) echo "HTTP ${code}: $(jq -r '.message // "sin detalle"' "$body" 2>/dev/null || echo 'sin detalle')"; rm -f "$body"; return 1 ;;
+          esac
+        }
+
+        if ! msg=$(report 2>&1); then
+          echo "::warning::NanoFlow no registró el plan de ${NF_ENV}: ${msg##*$'\n'}"
+        else
+          echo "$msg"
+        fi
+        exit 0

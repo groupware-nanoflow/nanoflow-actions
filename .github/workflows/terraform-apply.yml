@@ -1,0 +1,146 @@
+# Workflow reutilizable de NanoFlow: apply de Terraform del repo de infra de un
+# proyecto al llegar un push a la rama de un ambiente.
+#
+# Dos jobs: `resolve` lee .nanoflow/infra.json y decide el ambiente de la rama;
+# `apply` corre DENTRO del GitHub Environment de ese ambiente. Eso es lo que
+# hace que el `sub` del token OIDC sea `…:environment:<env>`, lo único que la
+# trust del rol de APPLY acepta; y el environment solo admite su rama. Se
+# planea de nuevo y se aplica ese plan guardado (nunca `-auto-approve` sobre
+# un plan no guardado). El despliegue se informa a NanoFlow como cualquier otro.
+name: NanoFlow terraform apply
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: Base del API de NanoFlow.
+        required: true
+        type: string
+      audience:
+        description: Audiencia OIDC de NanoFlow, p. ej. nanoflow-dev.
+        required: true
+        type: string
+      config:
+        required: false
+        type: string
+        default: .nanoflow/infra.json
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      live-logs:
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  resolve:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    outputs:
+      found: ${{ steps.env.outputs.found }}
+      environment: ${{ steps.env.outputs.environment }}
+      dir: ${{ steps.env.outputs.dir }}
+      region: ${{ steps.env.outputs.region }}
+      apply-role-arn: ${{ steps.env.outputs.apply-role-arn }}
+      terraform-version: ${{ steps.env.outputs.terraform-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: env
+        uses: groupware-nanoflow/nanoflow-actions/actions/infra-env@v2
+        with:
+          branch: ${{ github.ref_name }}
+          config: ${{ inputs.config }}
+
+  apply:
+    needs: resolve
+    if: needs.resolve.outputs.found == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ needs.resolve.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    # Un apply por ambiente a la vez, y nunca se cancela uno en curso.
+    concurrency:
+      group: nanoflow-terraform-apply-${{ github.repository }}-${{ needs.resolve.outputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ needs.resolve.outputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Credenciales de apply
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ needs.resolve.outputs.apply-role-arn }}
+          role-session-name: nanoflow-apply-${{ github.run_id }}
+          aws-region: ${{ needs.resolve.outputs.region }}
+
+      - name: Preparar el log en vivo
+        uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          check-run-id: ${{ job.check_run_id }}
+          enabled: ${{ inputs.live-logs }}
+
+      - name: Informar el inicio del despliegue
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-deployment@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          status: in_progress
+
+      - name: Plan y apply
+        id: apply
+        working-directory: ${{ needs.resolve.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run() {
+            if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ]; then
+              "$@" 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step apply
+            else
+              "$@"
+            fi
+          }
+          run terraform init -input=false -lock-timeout=5m
+          run terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan
+          run terraform apply -input=false -lock-timeout=5m -no-color tfplan
+          # La URL del frontend, si el blueprint creó uno.
+          url=$(terraform output -raw frontend_url 2>/dev/null || true)
+          [[ "$url" =~ ^https://[A-Za-z0-9.-]+$ ]] || url=''
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: Informar el resultado del despliegue
+        if: always()
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-deployment@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          status: ${{ job.status == 'success' && 'success' || (job.status == 'cancelled' && 'cancelled' || 'failure') }}
+          environment-url: ${{ steps.apply.outputs.url }}
+          error: ${{ steps.apply.outcome == 'failure' && 'terraform apply falló' || '' }}
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        env:
+          NF_ENV: ${{ needs.resolve.outputs.environment }}
+          NF_URL: ${{ steps.apply.outputs.url }}
+          NF_OUTCOME: ${{ steps.apply.outcome }}
+        run: |
+          {
+            echo "## Terraform apply · ${NF_ENV}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Resultado | ${NF_OUTCOME} |"
+            echo "| Rama | ${GITHUB_REF_NAME} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+            [ -n "$NF_URL" ] && echo "| URL | ${NF_URL} |"
+          } >> "$GITHUB_STEP_SUMMARY"

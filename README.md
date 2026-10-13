@@ -184,8 +184,43 @@ pueden informar un despliegue.
 - **Nunca dispares esto en `pull_request`.** NanoFlow lo rechaza de todos modos,
   pero el disparador correcto es `push` sobre las ramas de ambiente.
 
+## Repos de infraestructura (Terraform)
+
+El repo `<proyecto>-core-infra` que genera NanoFlow no usa el bróker de
+credenciales: cada cuenta de ambiente confía directamente en el OIDC de GitHub
+(stack de bootstrap de `nanoflow-infra-templates`), con dos roles:
+
+| Workflow | Disparador | Rol | Qué hace |
+|---|---|---|---|
+| `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan; reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
+| `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado y `apply` de ese plan; despliegue informado con `report-deployment`. |
+
+El ambiente de cada rama, su directorio, su cuenta y sus roles están en
+`.nanoflow/infra.json`, que también genera NanoFlow (acción `infra-env`). El
+repo solo llama a los workflows:
+
+```yaml
+jobs:
+  plan:
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/terraform-plan.yml@v2
+    with:
+      api-url: https://devapi-nanoflow.groupware.com.co
+      audience: nanoflow-dev
+```
+
+- Un hallazgo HIGH o CRITICAL de trivy falla el check, pero el plan y el reporte
+  se generan igual. Para aceptar uno, `# trivy:ignore:<id>` junto al recurso con
+  el motivo.
+- trivy se descarga de su release y se verifica contra los checksums
+  publicados; no se usan acciones de terceros para eso.
+- `report-plan` nunca falla el job: si NanoFlow no responde, deja un aviso.
+
+Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js`.
+
 ## Versionado
 
 Los repos de los clientes apuntan a `@v1`, una etiqueta móvil sobre la última
-versión compatible. Un cambio que rompa el contrato sale como `@v2` y los repos
-se migran cuando toque, no a la fuerza.
+versión compatible. Un cambio que rompa el contrato sale como una etiqueta
+nueva y los repos se migran cuando toque, no a la fuerza. `@v2` agrega los
+workflows de Terraform y las acciones `report-plan` e `infra-env`; `deploy-aws.yml`
+y las acciones de `@v1` no cambian.
