@@ -156,12 +156,58 @@ jobs:
       # rompe con cualquier comilla y convierte el manifiesto en parte del
       # script del workflow; así es solo lo que dice ser: un script.
       #
-      # La salida pasa por log-stream. Con pipefail el código de salida es el
-      # del script (log-stream sale siempre con 0), y se guarda para el reporte.
-      # Sin node o con el log en vivo apagado, el script corre solo.
+      # nf-run.sh corre el script con su salida en vivo (log-stream si el log en
+      # vivo está preparado; si no, solo eco) SIN atar el fin del paso a una
+      # tubería: el script escribe a un archivo que se sigue mientras corre. Con
+      # `script | node log-stream`, un hijo rezagado del build (vite, npm…) con
+      # la salida heredada dejaba la tubería abierta y el paso colgado aunque el
+      # build ya hubiera terminado. Sale con el código del script, que se guarda
+      # para el reporte. Es el mismo enfoque que actions/terraform-run.
+      - name: Preparar el runner de comandos
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/nf-run.sh" <<'NFRUN'
+          #!/usr/bin/env bash
+          # nf-run.sh — NF_SCRIPT=<archivo> NF_STEP=<paso> nf-run.sh
+          set -uo pipefail
+          : "${NF_SCRIPT:?NF_SCRIPT vacío}"
+          step="${NF_STEP:-run}"
+          log="$(mktemp "${RUNNER_TEMP:-/tmp}/nf-$step.XXXXXX")"
+          trap 'rm -f "$log"' EXIT
+          # Sin stdin: nada puede quedarse esperando una respuesta, y un hijo
+          # rezagado solo retiene el archivo.
+          bash -euo pipefail "$NF_SCRIPT" >"$log" 2>&1 </dev/null &
+          cmd=$!
+          # follow es el único escritor de la tubería hacia el lector y termina
+          # en cuanto el script sale (tras una última lectura).
+          follow() {
+            local offset=0 size alive
+            while :; do
+              alive=0
+              kill -0 "$cmd" 2>/dev/null && alive=1
+              size=$(wc -c <"$log" | tr -d ' ')
+              if [ "$size" -gt "$offset" ]; then
+                tail -c "+$((offset + 1))" "$log" | head -c "$((size - offset))"
+                offset=$size
+              fi
+              [ "$alive" = 0 ] && break
+              sleep 0.5
+            done
+          }
+          if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ] && command -v node >/dev/null 2>&1; then
+            follow | node "$NF_LOG_STREAM" --job "${GITHUB_JOB:-job}" --step "$step"
+          else
+            follow
+          fi
+          wait "$cmd"
+          NFRUN
+          chmod +x "$RUNNER_TEMP/nf-run.sh"
+
       - name: Build
         id: build
         if: steps.commands.outputs.build != ''
+        # Un build colgado falla en minutos (y se informa), no a las 6 horas.
+        timeout-minutes: 30
         working-directory: ${{ inputs.working-directory }}
         shell: bash
         env:
@@ -171,17 +217,14 @@ jobs:
           script="$RUNNER_TEMP/nf-build.sh"
           printf '%s\n' "$NF_BUILD" > "$script"
           set +e
-          if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ] && command -v node >/dev/null 2>&1; then
-            set -o pipefail; bash -euo pipefail "$script" 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step build
-          else
-            bash -euo pipefail "$script"
-          fi
+          NF_SCRIPT="$script" NF_STEP=build "$RUNNER_TEMP/nf-run.sh"
           rc=$?
           echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
           exit "$rc"
 
       - name: Deploy
         id: deploy
+        timeout-minutes: 30
         working-directory: ${{ inputs.working-directory }}
         shell: bash
         env:
@@ -191,11 +234,7 @@ jobs:
           script="$RUNNER_TEMP/nf-deploy.sh"
           printf '%s\n' "$NF_DEPLOY" > "$script"
           set +e
-          if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ] && command -v node >/dev/null 2>&1; then
-            set -o pipefail; bash -euo pipefail "$script" 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step deploy
-          else
-            bash -euo pipefail "$script"
-          fi
+          NF_SCRIPT="$script" NF_STEP=deploy "$RUNNER_TEMP/nf-run.sh"
           rc=$?
           echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
           exit "$rc"
