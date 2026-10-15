@@ -173,33 +173,68 @@ jobs:
           : "${NF_SCRIPT:?NF_SCRIPT vacío}"
           step="${NF_STEP:-run}"
           log="$(mktemp "${RUNNER_TEMP:-/tmp}/nf-$step.XXXXXX")"
-          trap 'rm -f "$log"' EXIT
           # Sin stdin: nada puede quedarse esperando una respuesta, y un hijo
           # rezagado solo retiene el archivo.
           bash -euo pipefail "$NF_SCRIPT" >"$log" 2>&1 </dev/null &
           cmd=$!
-          # follow es el único escritor de la tubería hacia el lector y termina
-          # en cuanto el script sale (tras una última lectura).
+          # Fin explícito por archivo, no por `kill -0`: un proceso que ya salió pero que
+          # el shell aún no recogió (zombie) sigue respondiendo a `kill -0`, y el
+          # seguimiento nunca terminaba (paso colgado con el build ya hecho).
+          done_flag="$log.done"
+          reader_flag="$log.reader"
+          trap 'rm -f "$log" "$done_flag" "$reader_flag"' EXIT
+
+          # follow imprime lo nuevo del archivo cada medio segundo y termina tras una
+          # última lectura cuando aparece done_flag: es el único escritor de la tubería
+          # hacia el lector, así que el lector recibe su fin de entrada a tiempo. Si la
+          # salida se detiene 5 min con el comando vivo, deja una vez el árbol de
+          # procesos en el log del paso para ver qué sigue corriendo.
           follow() {
-            local offset=0 size alive
+            local offset=0 size fin quiet=0 dumped=0
             while :; do
-              alive=0
-              kill -0 "$cmd" 2>/dev/null && alive=1
+              fin=0
+              [ -e "$done_flag" ] && fin=1
               size=$(wc -c <"$log" | tr -d ' ')
               if [ "$size" -gt "$offset" ]; then
                 tail -c "+$((offset + 1))" "$log" | head -c "$((size - offset))"
                 offset=$size
+                quiet=0
+              else
+                quiet=$((quiet + 1))
               fi
-              [ "$alive" = 0 ] && break
+              [ "$fin" = 1 ] && break
+              if [ "$quiet" -ge 600 ] && [ "$dumped" = 0 ]; then
+                dumped=1
+                { echo "::group::nf-run: 5 min sin salida; procesos en curso"; ps -eo pid,ppid,etime,args 2>/dev/null; echo "::endgroup::"; } >&2
+              fi
               sleep 0.5
             done
           }
+
+          # El lector, en segundo plano: log-stream si el log en vivo está preparado; si
+          # no, solo eco. reader_flag marca que terminó (también sin `kill -0`).
           if [ "${NF_LIVE_LOGS:-false}" = "true" ] && [ -n "${NF_LOG_STREAM:-}" ] && command -v node >/dev/null 2>&1; then
-            follow | node "$NF_LOG_STREAM" --job "${GITHUB_JOB:-job}" --step "$step"
+            { follow | node "$NF_LOG_STREAM" --job "${GITHUB_JOB:-job}" --step "$step"; : >"$reader_flag"; } &
           else
-            follow
+            { follow; : >"$reader_flag"; } &
           fi
+          reader=$!
+
           wait "$cmd"
+          rc=$?
+          : >"$done_flag"
+          # El lector cierra solo (log-stream se da hasta 10 s para vaciar lo pendiente);
+          # a los 20 s se corta, para que nada retenga el paso.
+          for _ in $(seq 1 40); do
+            [ -e "$reader_flag" ] && break
+            sleep 0.5
+          done
+          if [ ! -e "$reader_flag" ]; then
+            pkill -TERM -P "$reader" 2>/dev/null
+            kill -TERM "$reader" 2>/dev/null
+          fi
+          wait "$reader" 2>/dev/null
+          exit "$rc"
           NFRUN
           chmod +x "$RUNNER_TEMP/nf-run.sh"
 
