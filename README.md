@@ -194,6 +194,7 @@ credenciales: cada cuenta de ambiente confía directamente en el OIDC de GitHub
 |---|---|---|---|
 | `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan; reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
 | `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado y `apply` de ese plan; despliegue informado con `report-deployment`. |
+| `terraform-drift.yml` | `workflow_dispatch` del `drift.yml` del repo, que despacha NanoFlow (nunca `schedule`) en la rama del ambiente | `plan`, dentro del GitHub Environment del ambiente | init y `plan -detailed-exitcode`; reporte a NanoFlow (`report-plan` con `has-changes`). Encontrar drift no falla el job; un plan que falla, sí. Sin fmt, tflint, trivy ni comentario. |
 
 El ambiente de cada rama, su directorio, su cuenta y sus roles están en
 `.nanoflow/infra.json`, que también genera NanoFlow (acción `infra-env`). El
@@ -214,6 +215,9 @@ jobs:
 - trivy se descarga de su release y se verifica contra los checksums
   publicados; no se usan acciones de terceros para eso.
 - `report-plan` nunca falla el job: si NanoFlow no responde, deja un aviso.
+- `report-plan` acepta `has-changes` (`true`/`false`, el veredicto de
+  `-detailed-exitcode`) y lo envía como `hasChanges`. NanoFlow solo lo usa si
+  el token es de un `workflow_dispatch` de `.github/workflows/drift.yml`.
 - Cada fase de Terraform (`init`, `plan`, `apply`) es un paso propio con
   `timeout-minutes`, y corre con la acción `terraform-run`: el comando escribe a
   un archivo que se sigue en vivo, en vez de `terraform … | node log-stream`.

@@ -34,6 +34,12 @@ inputs:
     description: Commit planeado. En un PR, la cabeza del PR (GITHUB_SHA es el merge de prueba).
     required: false
     default: ''
+  has-changes:
+    description: >
+      Veredicto de `terraform plan -detailed-exitcode` en un drift: 'true' (salió
+      2) o 'false' (salió 0). Vacío = no se informa y NanoFlow usa el resumen.
+    required: false
+    default: ''
 
 outputs:
   summary-file:
@@ -87,6 +93,7 @@ runs:
         NF_PLAN: ${{ inputs.plan-json }}
         NF_PR: ${{ inputs.pr-number }}
         NF_HEAD_SHA: ${{ inputs.head-sha }}
+        NF_HAS_CHANGES: ${{ inputs.has-changes }}
         NF_DIR: ${{ runner.temp }}/nf-plan
       run: |
         # Sin `set -e` a propósito: este paso informa, no decide.
@@ -98,6 +105,7 @@ runs:
             return 1
           fi
           case "$NF_STATUS" in succeeded|failed) ;; *) echo "estado desconocido '${NF_STATUS}'"; return 1 ;; esac
+          case "$NF_HAS_CHANGES" in ''|true|false) ;; *) echo "has-changes inválido '${NF_HAS_CHANGES}'"; return 1 ;; esac
 
           local oidc payload body code plan_b64=''
           oidc=$(curl -sS --fail --max-time 10 --retry 2 --retry-connrefused \
@@ -118,6 +126,7 @@ runs:
           payload="$NF_DIR/payload.json"
           jq -n \
             --arg env "$NF_ENV" --arg status "$NF_STATUS" --arg pr "$NF_PR" \
+            --arg changes "$NF_HAS_CHANGES" \
             --arg sha "${NF_HEAD_SHA:-$GITHUB_SHA}" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
             --slurpfile summary "$NF_DIR/summary.json" \
             --rawfile plan "${plan_b64:-/dev/null}" \
@@ -126,6 +135,7 @@ runs:
               runId: ($run | tonumber), runAttempt: ($attempt | tonumber),
               summary: $summary[0]}
              + (if $pr != "" then {prNumber: ($pr | tonumber)} else {} end)
+             + (if $changes != "" then {hasChanges: ($changes == "true")} else {} end)
              + (if $findings != null then {findings: $findings} else {} end)
              + (if $plan != "" then {planGzipBase64: $plan} else {} end)' > "$payload" || {
             echo "no se pudo armar el cuerpo"
