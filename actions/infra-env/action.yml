@@ -1,0 +1,89 @@
+name: NanoFlow infra environment
+description: >
+  Lee .nanoflow/infra.json (lo genera NanoFlow con el repo de infra) y resuelve
+  qué ambiente corresponde a una rama: su directorio, su cuenta y los roles de
+  plan y apply. Una rama sin ambiente deja found=false; no falla.
+
+inputs:
+  branch:
+    description: Rama a resolver (la base del PR en un plan, la del push en un apply).
+    required: true
+  config:
+    description: Ruta del archivo de configuración.
+    required: false
+    default: .nanoflow/infra.json
+
+outputs:
+  found:
+    description: "'true' si la rama es la de un ambiente"
+    value: ${{ steps.resolve.outputs.found }}
+  environment:
+    value: ${{ steps.resolve.outputs.environment }}
+    description: development | staging | production
+  dir:
+    value: ${{ steps.resolve.outputs.dir }}
+    description: Directorio de Terraform del ambiente
+  account-id:
+    value: ${{ steps.resolve.outputs.account-id }}
+    description: Cuenta AWS del ambiente
+  region:
+    value: ${{ steps.resolve.outputs.region }}
+    description: Región
+  plan-role-arn:
+    value: ${{ steps.resolve.outputs.plan-role-arn }}
+    description: Rol de plan (PR y job del environment)
+  apply-role-arn:
+    value: ${{ steps.resolve.outputs.apply-role-arn }}
+    description: Rol de apply (solo el job del environment)
+  terraform-version:
+    value: ${{ steps.resolve.outputs.terraform-version }}
+    description: Versión de Terraform del repo
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        NF_BRANCH: ${{ inputs.branch }}
+        NF_CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        if [ ! -f "$NF_CONFIG" ]; then
+          echo "::error::No existe $NF_CONFIG. NanoFlow lo genera con el repo de infra; si lo borraste, vuelve a construir la infraestructura desde la consola."
+          exit 1
+        fi
+        env=$(jq -r --arg b "$NF_BRANCH" '.environments | to_entries[] | select(.value.branch == $b) | .key' "$NF_CONFIG" | head -n 1)
+        if [ -z "$env" ]; then
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::La rama ${NF_BRANCH} no es la de ningún ambiente: no hay nada que planear ni aplicar."
+          exit 0
+        fi
+        # Cada valor pasa por una validación: van a GITHUB_OUTPUT y de ahí a
+        # rutas y a la asunción de roles.
+        get() { jq -r --arg e "$env" "$1" "$NF_CONFIG"; }
+        dir=$(get '.environments[$e].dir')
+        account=$(get '.environments[$e].accountId')
+        region=$(get '.region')
+        plan=$(get '.environments[$e].planRoleArn')
+        apply=$(get '.environments[$e].applyRoleArn')
+        tf=$(get '.terraformVersion')
+        [[ "$env" =~ ^(development|staging|production)$ ]] || { echo "::error::ambiente inválido: $env"; exit 1; }
+        [[ "$dir" =~ ^envs/[a-z]+$ ]] || { echo "::error::directorio inválido: $dir"; exit 1; }
+        [[ "$account" =~ ^[0-9]{12}$ ]] || { echo "::error::cuenta inválida"; exit 1; }
+        [[ "$region" =~ ^[a-z]{2}(-gov)?-[a-z]+-[0-9]$ ]] || { echo "::error::región inválida: $region"; exit 1; }
+        for arn in "$plan" "$apply"; do
+          [[ "$arn" =~ ^arn:aws[a-z-]*:iam::${account}:role/[A-Za-z0-9+=,.@_-]+$ ]] || { echo "::error::rol inválido o de otra cuenta: $arn"; exit 1; }
+        done
+        [[ "$tf" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::versión de Terraform inválida: $tf"; exit 1; }
+        {
+          echo "found=true"
+          echo "environment=$env"
+          echo "dir=$dir"
+          echo "account-id=$account"
+          echo "region=$region"
+          echo "plan-role-arn=$plan"
+          echo "apply-role-arn=$apply"
+          echo "terraform-version=$tf"
+        } >> "$GITHUB_OUTPUT"
+        echo "Rama ${NF_BRANCH} → ${env} (${dir}, cuenta ${account}, ${region})"

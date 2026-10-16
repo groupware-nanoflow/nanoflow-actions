@@ -1,0 +1,91 @@
+name: NanoFlow log stream
+description: >
+  Prepara el filtro que reenvía a NanoFlow, en vivo, la salida de los pasos del
+  job. No envía nada por sí sola: deja la ruta del script en NF_LOG_STREAM para
+  que los pasos siguientes pasen su salida por él:
+  `cmd 2>&1 | node "$NF_LOG_STREAM" --job "$GITHUB_JOB" --step build`.
+
+inputs:
+  api-url:
+    description: Base del API de NanoFlow, p. ej. https://devapi-nanoflow.groupware.com.co
+    required: true
+  audience:
+    description: Audiencia que se le pide a GitHub, p. ej. nanoflow-dev. La misma que la de las credenciales.
+    required: true
+  check-run-id:
+    description: >
+      `job.check_run_id` del job, si el runner lo expone. Con él NanoFlow enlaza
+      las líneas con su job al instante; sin él, por nombre.
+    required: false
+    default: ''
+  mask-env:
+    description: >
+      Nombres de variables de entorno, separados por coma o espacio, cuyos
+      valores se tapan antes de enviar. Las credenciales de AWS se tapan siempre.
+    required: false
+    default: ''
+  enabled:
+    description: "'false' deja el filtro en modo solo-eco: imprime y no envía nada."
+    required: false
+    default: 'true'
+
+outputs:
+  script:
+    description: Ruta del filtro (la misma que queda en NF_LOG_STREAM)
+    value: ${{ steps.setup.outputs.script }}
+
+runs:
+  using: composite
+  steps:
+    - id: setup
+      shell: bash
+      env:
+        NF_SCRIPT: ${{ github.action_path }}/log-stream.js
+        IN_API_URL: ${{ inputs.api-url }}
+        IN_AUDIENCE: ${{ inputs.audience }}
+        IN_CHECK_RUN_ID: ${{ inputs.check-run-id }}
+        IN_MASK_ENV: ${{ inputs.mask-env }}
+        IN_ENABLED: ${{ inputs.enabled }}
+      run: |
+        set -euo pipefail
+
+        # Lo que se escribe en GITHUB_ENV define variables para el resto del job:
+        # un salto de línea en un input permitiría colar otra. Se rechaza.
+        for v in "$NF_SCRIPT" "$IN_API_URL" "$IN_AUDIENCE" "$IN_CHECK_RUN_ID" "$IN_MASK_ENV" "$IN_ENABLED"; do
+          if [[ "$v" == *$'\n'* || "$v" == *$'\r'* ]]; then
+            echo "::warning::log-stream: un input trae saltos de línea; el log en vivo queda desactivado."
+            IN_ENABLED=false
+            IN_API_URL=''; IN_AUDIENCE=''; IN_CHECK_RUN_ID=''; IN_MASK_ENV=''
+            break
+          fi
+        done
+        # Solo nombres de variable válidos; lo demás se ignora.
+        mask_env=$(printf '%s' "$IN_MASK_ENV" | tr ', ' '\n\n' | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | paste -sd, - || true)
+        [[ "$IN_CHECK_RUN_ID" =~ ^[0-9]+$ ]] || IN_CHECK_RUN_ID=''
+
+        enabled=true
+        if [ "$IN_ENABLED" = "false" ]; then
+          enabled=false
+        elif [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          # Sin id-token: write no hay token con el que enviar. No es un error: el
+          # log completo sigue en GitHub y NanoFlow lo archiva al terminar el job.
+          echo "::notice::Log en vivo desactivado: el job no tiene 'permissions: id-token: write'."
+          enabled=false
+        fi
+
+        {
+          echo "NF_LOG_STREAM=${NF_SCRIPT}"
+          echo "NF_API_URL=${IN_API_URL}"
+          echo "NF_AUDIENCE=${IN_AUDIENCE}"
+          echo "NF_CHECK_RUN_ID=${IN_CHECK_RUN_ID}"
+          echo "NF_MASK_ENV=${mask_env}"
+          echo "NF_LIVE_LOGS=${enabled}"
+        } >> "$GITHUB_ENV"
+        echo "script=${NF_SCRIPT}" >> "$GITHUB_OUTPUT"
+
+        if ! command -v node >/dev/null 2>&1; then
+          # Un runner propio sin node en el PATH: los pasos que usen el filtro
+          # deben comprobarlo (deploy-aws.yml lo hace) y ejecutar el comando solo.
+          echo "::notice::Log en vivo desactivado: no hay node en el PATH del runner."
+          echo "NF_LIVE_LOGS=false" >> "$GITHUB_ENV"
+        fi

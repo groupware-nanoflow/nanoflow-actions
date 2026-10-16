@@ -16,10 +16,20 @@ deploy: |
   terraform init -input=false
   terraform apply -auto-approve
 
-# Opcional: un ambiente puede sobrescribir cualquiera de los dos. Se resuelve
-# después de que NanoFlow decide el ambiente a partir de la rama.
+# Opcional: la URL pública de lo desplegado. NanoFlow la muestra junto al
+# despliegue cuando sale bien.
+url: https://dev.app.example.com
+
+# Opcional: variables de entorno de los pasos cuyos valores se tapan en el log
+# en vivo antes de salir del runner. Las credenciales de AWS se tapan siempre.
+# mask-env: [DB_PASSWORD, STRIPE_KEY]
+
+# Opcional: un ambiente puede sobrescribir build, deploy y url (y sumar
+# mask-env). Se resuelve después de que NanoFlow decide el ambiente a partir de
+# la rama.
 environments:
   production:
+    url: https://app.example.com
     deploy: |
       terraform init -input=false
       terraform apply -auto-approve -var-file=prod.tfvars
