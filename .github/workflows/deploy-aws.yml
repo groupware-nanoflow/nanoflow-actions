@@ -36,10 +36,21 @@ on:
         required: false
         type: boolean
         default: true
+      environment:
+        description: >
+          GitHub Environment del ambiente de esta rama (development, staging,
+          production). Con él, el job ve las variables NF_* que NanoFlow escribe
+          ahí (el contrato de plataforma: URL del API, issuer OIDC…) y las
+          exporta a build y deploy. NanoFlow comprueba que sea el de la rama.
+          Vacío: sin GitHub Environment, como antes.
+        required: false
+        type: string
+        default: ''
 
 jobs:
   deploy:
     runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
     permissions:
       # Lo mínimo: leer el código y poder pedir el token OIDC. En particular NO
       # se pide `contents: write`: un despliegue no reescribe el repositorio.
@@ -116,6 +127,63 @@ jobs:
             echo "url=${url}"
             echo "mask-env=${mask_env}"
           } >> "$GITHUB_OUTPUT"
+
+      # El contrato de plataforma del ambiente (doc 11 §11 de la consola): las
+      # variables NF_* del GitHub Environment pasan al entorno de build y deploy,
+      # y el manifiesto puede darles otro nombre con env-map (p. ej.
+      # VITE_API_URL: NF_API_URL) en la raíz o por ambiente. Solo se imprimen
+      # nombres. Sin `environment` no hay variables NF_* y el paso no hace nada.
+      - name: Contrato de plataforma
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          ENVIRONMENT: ${{ steps.aws.outputs.environment }}
+          DECLARED: ${{ inputs.environment }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DECLARED" ] && [ "$DECLARED" != "$ENVIRONMENT" ]; then
+            echo "::error::El workflow declara el GitHub Environment ${DECLARED}, pero NanoFlow resolvió ${ENVIRONMENT} para esta rama."
+            exit 1
+          fi
+          # name=value en una línea cada uno; un valor con salto de línea se
+          # escribe con delimitador.
+          export_var() {
+            local name="$1" value="$2" delim
+            if [[ "$value" == *$'\n'* ]]; then
+              delim="__NF_$(openssl rand -hex 8)__"
+              { echo "${name}<<${delim}"; echo "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+            else
+              echo "${name}=${value}" >> "$GITHUB_ENV"
+            fi
+          }
+          # Solo las NF_* con valor string: el contrato.
+          contract=$(jq -c 'with_entries(select((.key | test("^NF_[A-Z0-9_]+$")) and (.value | type == "string")))' <<< "$VARS_JSON")
+          if [ "$(jq 'length' <<< "$contract")" -eq 0 ]; then
+            echo "Sin variables NF_* en este job (sin GitHub Environment o NanoFlow aún no las escribió)."
+            exit 0
+          fi
+          while IFS= read -r name; do
+            export_var "$name" "$(jq -r --arg n "$name" '.[$n]' <<< "$contract")"
+          done < <(jq -r 'keys[]' <<< "$contract")
+          echo "Contrato de plataforma: $(jq -r 'keys | join(" ")' <<< "$contract")"
+          # env-map: DESTINO: NF_ORIGEN. Lo del ambiente gana sobre la raíz.
+          mapped=$(yq -o=json '(.["env-map"] // {}) * (.environments.'"${ENVIRONMENT}"'["env-map"] // {})' "$MANIFEST")
+          while IFS=$'\t' read -r target source; do
+            [ -n "$target" ] || continue
+            if ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || [[ "$target" =~ ^(AWS_|GITHUB_|ACTIONS_|RUNNER_|NF_) ]]; then
+              echo "::warning::env-map: '${target}' no es un nombre válido o es reservado; se ignora."
+              continue
+            fi
+            if [ "$(jq --arg n "$source" 'has($n)' <<< "$contract")" != true ]; then
+              # Normal: el env-map generado lista también las claves OIDC, que
+              # solo existen con un proveedor de identidad.
+              echo "  ${target}: ${source} no está en el contrato de este ambiente; se omite."
+              continue
+            fi
+            export_var "$target" "$(jq -r --arg n "$source" '.[$n]' <<< "$contract")"
+            echo "  ${target} ← ${source}"
+          done < <(jq -r 'to_entries[] | [.key, (.value | tostring)] | @tsv' <<< "$mapped")
 
       # El log en vivo: GitHub no expone el de un job mientras corre, así que
       # build y deploy pasan su salida por log-stream, que la sigue imprimiendo

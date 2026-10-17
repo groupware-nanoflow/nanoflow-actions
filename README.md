@@ -70,6 +70,24 @@ Dos claves opcionales más, en la raíz o por ambiente:
 |---|---|
 | `url` | URL pública de lo desplegado; NanoFlow la guarda cuando el despliegue sale bien |
 | `mask-env` | variables de entorno cuyos valores se tapan en el log en vivo (lista o texto separado por comas) |
+| `env-map` | `DESTINO: NF_ORIGEN`: copia una variable del contrato de plataforma con otro nombre para el build (p. ej. `VITE_API_URL: NF_API_URL`). Lo del ambiente gana sobre la raíz. |
+
+### Contrato de plataforma (`environment`)
+
+Con el input `environment` (el GitHub Environment del ambiente de la rama:
+`development`, `staging` o `production`), el job corre dentro de ese
+environment. Ahí NanoFlow escribe las variables `NF_*` del contrato de
+plataforma: `NF_API_URL`, `NF_FRONTEND_URL`, `NF_IDENTITY_PROVIDER`,
+`NF_OIDC_ISSUER`, `NF_OIDC_AUDIENCE`, `NF_OIDC_CLIENT_ID`, `NF_TENANT_CLAIM`,
+`NF_ENVIRONMENT`… (salen de los outputs del apply del repo core-infra; doc 11
+§11 de la consola). El paso «Contrato de plataforma» las exporta a build y
+deploy y aplica `env-map`. NanoFlow comprueba que el environment declarado sea
+el de la rama; si no, falla. El `deploy.yml` que genera NanoFlow ya lo pasa:
+
+```yaml
+    with:
+      environment: ${{ github.ref_name == 'develop' && 'development' || github.ref_name == 'main' && 'production' || '' }}
+```
 
 ## Qué ve NanoFlow del despliegue
 
@@ -193,7 +211,7 @@ credenciales: cada cuenta de ambiente confía directamente en el OIDC de GitHub
 | Workflow | Disparador | Rol | Qué hace |
 |---|---|---|---|
 | `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan; reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
-| `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado y `apply` de ese plan; despliegue informado con `report-deployment`. |
+| `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado y `apply` de ese plan; despliegue informado con `report-deployment`; si el apply sale bien, el output `nanoflow_contract` va a NanoFlow con `report-outputs` (`POST /v1/ci/infra-outputs`), que lo escribe como variables `NF_*` en los repos de aplicación. |
 | `terraform-drift.yml` | `workflow_dispatch` del `drift.yml` del repo, que despacha NanoFlow (nunca `schedule`) en la rama del ambiente | `plan`, dentro del GitHub Environment del ambiente | init y `plan -detailed-exitcode`; reporte a NanoFlow (`report-plan` con `has-changes`). Encontrar drift no falla el job; un plan que falla, sí. Sin fmt, tflint, trivy ni comentario. |
 
 El ambiente de cada rama, su directorio, su cuenta y sus roles están en
@@ -214,7 +232,7 @@ jobs:
   el motivo.
 - trivy se descarga de su release y se verifica contra los checksums
   publicados; no se usan acciones de terceros para eso.
-- `report-plan` nunca falla el job: si NanoFlow no responde, deja un aviso.
+- `report-plan` y `report-outputs` nunca fallan el job: si NanoFlow no responde, dejan un aviso. Un repo sin el output `nanoflow_contract` (templates < 0.6.0) se salta sin aviso de error.
 - `report-plan` acepta `has-changes` (`true`/`false`, el veredicto de
   `-detailed-exitcode`) y lo envía como `hasChanges`. NanoFlow solo lo usa si
   el token es de un `workflow_dispatch` de `.github/workflows/drift.yml`.
@@ -231,5 +249,6 @@ Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log
 Los repos de los clientes apuntan a `@v1`, una etiqueta móvil sobre la última
 versión compatible. Un cambio que rompa el contrato sale como una etiqueta
 nueva y los repos se migran cuando toque, no a la fuerza. `@v2` agrega los
-workflows de Terraform y las acciones `report-plan` e `infra-env`; `deploy-aws.yml`
-y las acciones de `@v1` no cambian.
+workflows de Terraform y las acciones `report-plan`, `report-outputs` e
+`infra-env`. `deploy-aws.yml` agregó el input opcional `environment` y la clave
+`env-map` sin romper a quien no los usa, así que siguió en `@v1`.

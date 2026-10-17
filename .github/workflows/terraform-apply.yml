@@ -136,6 +136,18 @@ jobs:
           [[ "$url" =~ ^https://[A-Za-z0-9.-]+$ ]] || url=''
           echo "url=${url}" >> "$GITHUB_OUTPUT"
 
+      # El contrato de plataforma (output nanoflow_contract) va a NanoFlow, que
+      # lo escribe como variables NF_* en los repos de aplicación. Solo tras un
+      # apply bueno: un apply a medias puede haber dejado outputs viejos.
+      - name: Informar el contrato de plataforma
+        if: steps.apply.outcome == 'success'
+        timeout-minutes: 3
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-outputs@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          working-directory: ${{ needs.resolve.outputs.dir }}
+
       - name: Informar el resultado del despliegue
         if: always()
         uses: groupware-nanoflow/nanoflow-actions/actions/report-deployment@v2
