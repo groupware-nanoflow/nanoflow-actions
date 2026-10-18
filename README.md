@@ -131,16 +131,33 @@ base real. Lo hace contra un Postgres 16 del propio job y sin credenciales de AW
 
 ```yaml
 on:
-  pull_request:
-    paths: ['db/**', '.nanoflow/deploy.yml']
+  pull_request:   # sin filtro de paths: el gate de la promoción exige el check
 jobs:
   db-check:
     permissions:
       contents: read
+      id-token: write
     uses: groupware-nanoflow/nanoflow-actions/.github/workflows/db-check.yml@v1
     with:
+      api-url: https://devapi-nanoflow.groupware.com.co
       audience: nanoflow-dev
 ```
+
+Con `api-url`, en un `pull_request`, `db-check` informa a NanoFlow el resultado de cada base
+(`kind: check`): las migraciones nuevas frente a la rama base, con su kind. Es el **dry-run de la
+promoción**: el PR de promoción apunta a la rama del ambiente destino, y NanoFlow no mergea la
+promoción sin un check verde de ese head. Además exige la confirmación de las `destructive` y, en
+producción, la casilla del aprobador para las `contract`/`destructive` (doc 11 §16).
+
+**Drift de esquema.** El workflow reutilizable `db-drift.yml` no migra nada:
+- Solo lectura: por cada base invoca `status` en su migrador con los archivos de la rama.
+- Informa `in_sync`, `pending` (archivos sin aplicar) o `mismatch` (una versión aplicada cambió o no
+  está en el repo; falla el job).
+- Lo despacha el mantenimiento diario de NanoFlow.
+
+El repo dueño no escribe estos workflows: el espejo de la arquitectura genera
+`.github/workflows/nanoflow-db.yml`, que llama a `db-check.yml` en cada PR y a `db-drift.yml` en un
+`workflow_dispatch` con `environment`.
 
 ## Qué ve NanoFlow del despliegue
 
@@ -305,5 +322,5 @@ nueva y los repos se migran cuando toque, no a la fuerza. `@v2` agrega los
 workflows de Terraform y las acciones `report-plan`, `report-outputs` e
 `infra-env`. `deploy-aws.yml` agregó el input opcional `environment` y la clave
 `env-map` sin romper a quien no los usa, así que siguió en `@v1`; lo mismo
-la clave `databases` (paso «Migraciones», acción `db-migrate`) y el workflow
-`db-check.yml`.
+la clave `databases` (paso «Migraciones», acción `db-migrate`) y los workflows
+`db-check.yml` y `db-drift.yml`.

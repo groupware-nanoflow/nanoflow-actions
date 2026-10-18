@@ -22,6 +22,10 @@ inputs:
   environment:
     description: Ambiente que resolvió NanoFlow para la rama (development, staging, production).
     required: true
+  mode:
+    description: apply (migra antes del deploy) o drift (solo lectura, informa el drift de esquema).
+    required: false
+    default: apply
   migrator-version:
     description: Versión de nanoflow-db-migrator que se instala en la Lambda.
     required: false
@@ -45,6 +49,7 @@ runs:
     - id: migrate
       shell: bash
       env:
+        MODE: ${{ inputs.mode }}
         MANIFEST: ${{ inputs.manifest }}
         NF_ENVIRONMENT: ${{ inputs.environment }}
         NF_API_URL: ${{ inputs.api-url }}

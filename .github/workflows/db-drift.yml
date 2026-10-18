@@ -1,0 +1,90 @@
+# Workflow reutilizable de NanoFlow: drift de esquema de las bases Postgres
+# del repo dueño en el ambiente de la rama (doc 11 §16 de la consola,
+# E6c-D4). Solo lectura: por cada base del manifiesto invoca `status` en su
+# Lambda migradora con los archivos de la rama e informa a NanoFlow si está en
+# sincronía, si hay pendientes o si la base no coincide con el repo. Lo
+# despacha el mantenimiento diario de NanoFlow (workflow_dispatch con
+# `environment`) a través de .github/workflows/nanoflow-db.yml, que genera el
+# espejo de la arquitectura.
+name: NanoFlow db drift
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: Base del API de NanoFlow.
+        required: true
+        type: string
+      audience:
+        description: Audiencia OIDC, p. ej. nanoflow-dev.
+        required: true
+        type: string
+      environment:
+        description: GitHub Environment del ambiente de la rama (development, staging, production).
+        required: true
+        type: string
+      manifest:
+        required: false
+        type: string
+        default: .nanoflow/deploy.yml
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      migrator-version:
+        required: false
+        type: string
+        default: 1.1.0
+
+jobs:
+  drift:
+    runs-on: ${{ inputs.runs-on }}
+    # El GitHub Environment trae las variables NF_DB_<NOMBRE>_MIGRATOR.
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: yq
+        shell: bash
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+      - name: Credenciales del ambiente
+        id: aws
+        uses: groupware-nanoflow/nanoflow-actions/actions/aws-credentials@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+
+      # Solo las NF_DB_*_MIGRATOR del environment; el ambiente lo decide
+      # NanoFlow por la rama y tiene que ser el declarado.
+      - name: Migradores del contrato
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ steps.aws.outputs.environment }}
+          DECLARED: ${{ inputs.environment }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          if [ "$DECLARED" != "$ENVIRONMENT" ]; then
+            echo "::error::Se pidió el drift de ${DECLARED}, pero NanoFlow resolvió ${ENVIRONMENT} para esta rama."
+            exit 1
+          fi
+          jq -r 'to_entries[] | select((.key | test("^NF_DB_[A-Z0-9_]+_MIGRATOR$")) and (.value | type == "string") and (.value | test("^[A-Za-z0-9_-]{1,64}$"))) | "\(.key)=\(.value)"' <<< "$VARS_JSON" >> "$GITHUB_ENV"
+
+      - name: Drift
+        uses: groupware-nanoflow/nanoflow-actions/actions/db-migrate@v1
+        with:
+          mode: drift
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          manifest: ${{ inputs.manifest }}
+          environment: ${{ steps.aws.outputs.environment }}
+          migrator-version: ${{ inputs.migrator-version }}

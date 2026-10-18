@@ -8,6 +8,10 @@ description: >
   fetch-depth 0). Lo usa el workflow reutilizable db-check.yml.
 
 inputs:
+  api-url:
+    description: Base del API de NanoFlow. Con ella, en un pull_request, el resultado se informa a NanoFlow (dry-run de la promoción; requiere id-token write).
+    required: false
+    default: ''
   audience:
     description: Audiencia OIDC de NanoFlow, p. ej. nanoflow-dev. Elige el bucket público del migrador.
     required: true
@@ -69,4 +73,8 @@ runs:
         MIGRATOR_BIN: ${{ steps.tools.outputs.migrator }}
         SQUAWK_BIN: ${{ steps.tools.outputs.squawk }}
         BASE_REF: ${{ github.base_ref }}
+        NF_API_URL: ${{ inputs.api-url }}
+        NF_AUDIENCE: ${{ inputs.audience }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
       run: '"$GITHUB_ACTION_PATH/check.sh"'

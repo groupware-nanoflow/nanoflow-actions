@@ -12,8 +12,14 @@
 #   4. Informa el resultado a NanoFlow (POST /v1/ci/migrations). El reporte
 #      nunca hace fallar el paso; una migración fallida sí.
 #
-# Entorno: MANIFEST, NF_ENVIRONMENT (development|staging|production, el que
-# resolvió NanoFlow), NF_API_URL, NF_AUDIENCE, MIGRATOR_VERSION,
+# Con MODE=drift (workflow db-drift.yml, doc 11 §16 E6c-D4) no migra nada:
+# por cada base invoca `status` con los archivos de la rama e informa el drift
+# (in_sync | pending | mismatch) con el estado aplicado. Sale con 1 si alguna
+# base está desalineada o no respondió.
+#
+# Entorno: MODE (apply por defecto | drift), MANIFEST, NF_ENVIRONMENT
+# (development|staging|production, el que resolvió NanoFlow), NF_API_URL,
+# NF_AUDIENCE, MIGRATOR_VERSION,
 # MIGRATOR_BASE_URL (opcional), credenciales AWS de la cuenta del ambiente,
 # GITHUB_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_OUTPUT.
 # Salidas: status (skipped|succeeded|failed) y error ("<base>: <código>").
@@ -24,6 +30,8 @@ set -euo pipefail
 : "${MANIFEST:?MANIFEST vacío}"
 : "${NF_ENVIRONMENT:?NF_ENVIRONMENT vacío}"
 MIGRATOR_VERSION="${MIGRATOR_VERSION:-1.1.0}"
+MODE="${MODE:-apply}"
+case "$MODE" in apply|drift) ;; *) echo "::error::MODE '${MODE}' no es apply ni drift."; exit 2 ;; esac
 SNAPSHOT_WAIT_SECONDS="${SNAPSHOT_WAIT_SECONDS:-3600}"
 # Límite del payload síncrono de Lambda (6 MB), con margen para el envoltorio.
 MAX_PAYLOAD_BYTES=$((6 * 1000 * 1000 - 4096))
@@ -99,10 +107,10 @@ kind_of() {
     END { if (!found) print "unknown" }' "$1"
 }
 
-# report <base> <respuesta apply> <respuesta status|""> <snapshot>: POST
-# /v1/ci/migrations. Solo avisa si falla.
-report() {
-  local db="$1" applied="$2" state="$3" snapshot="$4" oidc payload body code
+# post_report <base> <payload.json>: POST /v1/ci/migrations con el token OIDC
+# del job. Solo avisa si falla.
+post_report() {
+  local db="$1" payload="$2" oidc body code
   if [ -z "${NF_API_URL:-}" ]; then return 0; fi
   if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
     echo "::warning::NanoFlow no registró las migraciones de ${db}: el job no tiene 'permissions: id-token: write'."
@@ -115,7 +123,27 @@ report() {
     echo "::warning::NanoFlow no registró las migraciones de ${db}: GitHub no devolvió un token OIDC."
     return 0
   fi
-  payload="$work/report.json"
+  body="$work/report-body.json"
+  code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 --retry 2 --retry-connrefused \
+    -X POST "${NF_API_URL%/}/v1/ci/migrations" \
+    -H "Authorization: Bearer ${oidc}" -H 'Content-Type: application/json' -H 'Accept: application/json' \
+    --data-binary "@$payload") || code="000"
+  if [ "$code" != "200" ]; then
+    echo "::warning::NanoFlow no registró las migraciones de ${db}: HTTP ${code} $(jq -r '.message // ""' "$body" 2>/dev/null | head -c 300)"
+    return 0
+  fi
+  echo "  NanoFlow registró las migraciones de ${db}$(jq -r 'if .stale then " (reporte más viejo que el guardado)" else "" end' "$body" 2>/dev/null)."
+}
+
+# state_of <respuesta status|"">: el estado aplicado para el reporte (null si
+# no hay una respuesta ok).
+state_filter='(if $st != null and $st.ok then [($st.applied // [])[] | {version, name, kind, checksum, appliedAt, appliedBy}] else null end)'
+
+# report <base> <respuesta apply> <respuesta status|""> <snapshot>: informa una
+# corrida de apply.
+report() {
+  local db="$1" applied="$2" state="$3" snapshot="$4" payload="$work/report.json"
+  if [ -z "${NF_API_URL:-}" ]; then return 0; fi
   if ! jq -n --arg db "$db" --arg v "$MIGRATOR_VERSION" --arg snap "$snapshot" \
     --slurpfile a "$applied" --slurpfile s "${state:-/dev/null}" '
     ($a[0]) as $r | ($s[0] // null) as $st |
@@ -127,21 +155,36 @@ report() {
       pending: ($r.pending // []),
       error: (if $r.ok then null else ($r.error // {code: "UNKNOWN", message: "sin detalle"}) end),
       snapshotId: (if $snap == "" then null else $snap end),
-      state: (if $st != null and $st.ok then [($st.applied // [])[] | {version, name, kind, checksum, appliedAt, appliedBy}] else null end)
+      state: '"$state_filter"'
     }' > "$payload"; then
     echo "::warning::NanoFlow no registró las migraciones de ${db}: no se pudo armar el reporte."
     return 0
   fi
-  body="$work/report-body.json"
-  code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 --retry 2 --retry-connrefused \
-    -X POST "${NF_API_URL%/}/v1/ci/migrations" \
-    -H "Authorization: Bearer ${oidc}" -H 'Content-Type: application/json' -H 'Accept: application/json' \
-    --data-binary "@$payload") || code="000"
-  if [ "$code" != "200" ]; then
-    echo "::warning::NanoFlow no registró las migraciones de ${db}: HTTP ${code} $(jq -r '.message // ""' "$body" 2>/dev/null | head -c 300)"
+  post_report "$db" "$payload"
+}
+
+# report_drift <base> <drift|""> <respuesta status> <respuesta status completo|"">:
+# informa una corrida de drift (kind=drift, §16.2).
+report_drift() {
+  local db="$1" drift="$2" resp="$3" state="$4" payload="$work/report.json"
+  if [ -z "${NF_API_URL:-}" ]; then return 0; fi
+  if ! jq -n --arg db "$db" --arg v "$MIGRATOR_VERSION" --arg drift "$drift" \
+    --slurpfile a "$resp" --slurpfile s "${state:-/dev/null}" '
+    ($a[0]) as $r | ($s[0] // null) as $st |
+    {
+      kind: "drift",
+      database: $db,
+      migratorVersion: $v,
+      status: (if $drift == "" then "failed" else "succeeded" end),
+      drift: (if $drift == "" then null else $drift end),
+      pending: ($r.pending // []),
+      error: (if $r.ok then null else ($r.error // {code: "UNKNOWN", message: "sin detalle"}) end),
+      state: '"$state_filter"'
+    }' > "$payload"; then
+    echo "::warning::NanoFlow no registró el drift de ${db}: no se pudo armar el reporte."
     return 0
   fi
-  echo "  NanoFlow registró las migraciones de ${db}$(jq -r 'if .stale then " (reporte más viejo que el guardado)" else "" end' "$body" 2>/dev/null)."
+  post_report "$db" "$payload"
 }
 
 # snapshot <identificador> <cluster true|false> <nombre>: crea el snapshot y
@@ -224,6 +267,32 @@ for i in $(seq 0 $((count - 1))); do
   jq -s '.' "$work/files.ndjson" > "$files"
   echo "$(jq 'length' "$files") archivos en ${dir}"
 
+  if [ "$MODE" = drift ]; then
+    # Solo lectura: status con los archivos de la rama.
+    jq -c '{action: "status", files: .}' "$files" > "$work/p.json"
+    invoke "$fn" "$work/p.json" "$work/drift.json"
+    if jq -e '.ok' "$work/drift.json" >/dev/null; then
+      if [ "$(jq '.pending | length' "$work/drift.json")" -gt 0 ]; then drift=pending; else drift=in_sync; fi
+      state="$work/drift.json"
+    elif [ "$(jq -r '.error.code' "$work/drift.json")" = "CHECKSUM_MISMATCH" ]; then
+      drift=mismatch
+      echo '{"action":"status"}' > "$work/p.json"
+      invoke "$fn" "$work/p.json" "$work/after.json"
+      state="$work/after.json"
+    else
+      drift=""; state=""
+    fi
+    echo "::endgroup::"
+    report_drift "$db" "$drift" "$work/drift.json" "$state"
+    case "$drift" in
+      in_sync) summary="${summary}| ${db} | ✓ en sincronía | |"$'\n' ;;
+      pending) summary="${summary}| ${db} | ⚠ pendientes: $(jq -r '.pending | join(", ")' "$work/drift.json") | |"$'\n' ;;
+      mismatch) fail SCHEMA_DRIFT "la base no coincide con ${dir}: $(jq -r '.error.message' "$work/drift.json")" ;;
+      *) fail "$(jq -r '.error.code' "$work/drift.json")" "$(jq -r '.error.message' "$work/drift.json")" ;;
+    esac
+    continue
+  fi
+
   # 1) bootstrap
   echo '{"action":"bootstrap"}' > "$work/p.json"
   invoke "$fn" "$work/p.json" "$work/bootstrap.json"
@@ -293,7 +362,7 @@ for i in $(seq 0 $((count - 1))); do
 done
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -n "$summary" ]; then
-  { echo "### Migraciones (${NF_ENVIRONMENT})"; echo ""; echo "| Base | Resultado | Esquema |"; echo "|---|---|---|"; printf '%s' "$summary"; } >> "$GITHUB_STEP_SUMMARY"
+  { if [ "$MODE" = drift ]; then echo "### Drift de esquema (${NF_ENVIRONMENT})"; else echo "### Migraciones (${NF_ENVIRONMENT})"; fi; echo ""; echo "| Base | Resultado | Esquema |"; echo "|---|---|---|"; printf '%s' "$summary"; } >> "$GITHUB_STEP_SUMMARY"
 fi
 out "status=${final_status}"
 out "error=${final_error}"

@@ -1,23 +1,32 @@
 # Workflow reutilizable de NanoFlow: revisa las migraciones Postgres de un PR
 # del repo dueño de una base (doc 11 §14 de la consola, E5-D10). No usa
-# credenciales de AWS ni de NanoFlow: todo corre contra un Postgres 16 efímero
-# del propio job. Sin `databases` en el manifiesto no hace nada.
+# credenciales de AWS: todo corre contra un Postgres 16 efímero del propio job.
+# Con `api-url`, informa el resultado a NanoFlow con el token OIDC del job: es
+# el dry-run que exigen los gates de la promoción (§16). Sin `databases` en el
+# manifiesto no hace nada. NanoFlow genera el workflow que lo llama
+# (.github/workflows/nanoflow-db.yml).
 #
 #   on:
-#     pull_request:
-#       paths: ['db/**', '.nanoflow/deploy.yml']
+#     pull_request:   # sin filtro de paths: el gate de la promoción exige el check
 #   jobs:
 #     db-check:
 #       permissions:
 #         contents: read
+#         id-token: write
 #       uses: groupware-nanoflow/nanoflow-actions/.github/workflows/db-check.yml@v1
 #       with:
+#         api-url: https://devapi-nanoflow.groupware.com.co
 #         audience: nanoflow-dev
 name: NanoFlow db check
 
 on:
   workflow_call:
     inputs:
+      api-url:
+        description: Base del API de NanoFlow; vacío = no informar.
+        required: false
+        type: string
+        default: ''
       audience:
         description: Audiencia OIDC de NanoFlow (elige el bucket público del migrador).
         required: true
@@ -40,6 +49,7 @@ jobs:
     runs-on: ${{ inputs.runs-on }}
     permissions:
       contents: read
+      id-token: write
     timeout-minutes: 20
     services:
       postgres:
@@ -58,6 +68,7 @@ jobs:
 
       - uses: groupware-nanoflow/nanoflow-actions/actions/db-check@v1
         with:
+          api-url: ${{ inputs.api-url }}
           audience: ${{ inputs.audience }}
           manifest: ${{ inputs.manifest }}
           migrator-version: ${{ inputs.migrator-version }}
