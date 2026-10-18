@@ -103,6 +103,18 @@ jobs:
           check-run-id: ${{ job.check_run_id }}
           enabled: ${{ inputs.live-logs }}
 
+      # Proveedores externos (Auth0): el job corre en el environment y ve sus
+      # secretos, así que el drift sí refresca contra Auth0.
+      - name: Credenciales de proveedores externos
+        uses: groupware-nanoflow/nanoflow-actions/actions/provider-credentials@v2
+        with:
+          environment: ${{ steps.env.outputs.environment }}
+          working-directory: ${{ steps.env.outputs.dir }}
+          mode: apply
+          vars-json: ${{ toJSON(vars) }}
+          auth0-client-id: ${{ secrets.AUTH0_CLIENT_ID }}
+          auth0-client-secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+
       - name: Init
         id: init
         timeout-minutes: 10

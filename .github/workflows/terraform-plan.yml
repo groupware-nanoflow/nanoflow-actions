@@ -140,15 +140,27 @@ jobs:
           "$dir/trivy" config --quiet --format json --output "$RUNNER_TEMP/trivy.json" .
           "$dir/trivy" config --quiet --severity HIGH,CRITICAL --exit-code 1 .
 
+      # Proveedores externos (Auth0): un PR no ve los secretos del environment;
+      # el plan va sin refresh (lo dice el aviso del paso).
+      - name: Credenciales de proveedores externos
+        id: creds
+        if: steps.env.outputs.found == 'true'
+        uses: groupware-nanoflow/nanoflow-actions/actions/provider-credentials@v2
+        with:
+          environment: ${{ steps.env.outputs.environment }}
+          working-directory: ${{ steps.env.outputs.dir }}
+          mode: plan
+          vars-json: ${{ toJSON(vars) }}
+
       - name: Plan
         id: plan
-        if: steps.env.outputs.found == 'true' && steps.init.outcome == 'success'
+        if: steps.env.outputs.found == 'true' && steps.init.outcome == 'success' && steps.creds.outcome == 'success'
         timeout-minutes: 20
         uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
         with:
           step: plan
           working-directory: ${{ steps.env.outputs.dir }}
-          command: terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+          command: terraform plan -input=false -lock-timeout=5m -no-color ${{ steps.creds.outputs.plan-args }} -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
 
       - name: Informar el plan
         id: report

@@ -100,6 +100,18 @@ jobs:
       # Cada fase en su paso: si una se cuelga, GitHub muestra cuál. Las corre
       # terraform-run, que no ata el fin del paso a la tubería del log en vivo
       # (un hijo de terraform con la salida heredada colgaba el paso).
+      # Proveedores externos (Auth0): secretos del GitHub Environment que el
+      # usuario carga en NanoFlow.
+      - name: Credenciales de proveedores externos
+        uses: groupware-nanoflow/nanoflow-actions/actions/provider-credentials@v2
+        with:
+          environment: ${{ needs.resolve.outputs.environment }}
+          working-directory: ${{ needs.resolve.outputs.dir }}
+          mode: apply
+          vars-json: ${{ toJSON(vars) }}
+          auth0-client-id: ${{ secrets.AUTH0_CLIENT_ID }}
+          auth0-client-secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+
       - name: Init
         timeout-minutes: 10
         uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2

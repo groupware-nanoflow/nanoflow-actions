@@ -1,0 +1,49 @@
+name: NanoFlow provider credentials
+description: >
+  Credenciales de los proveedores externos que configura Terraform (hoy Auth0,
+  doc 11 §18 de la consola). Si el ambiente usa el provider auth0/auth0, toma
+  el dominio de la variable de repo NF_AUTH0_DOMAIN_<AMBIENTE> y el client M2M
+  de los secretos AUTH0_CLIENT_ID y AUTH0_CLIENT_SECRET del GitHub Environment
+  (los carga el usuario en NanoFlow), y los deja en el entorno de los pasos
+  siguientes. Un PR no corre en el environment y no ve esos secretos: el plan
+  del PR usa credenciales vacías y `-refresh=false` (el apply vuelve a planear
+  con refresh y el drift diario lo detecta). Sin auth0 no hace nada.
+
+inputs:
+  environment:
+    description: Ambiente (development, staging, production).
+    required: true
+  working-directory:
+    description: Directorio de Terraform del ambiente.
+    required: true
+  mode:
+    description: plan (PR, sin secretos) o apply (job del environment, los exige).
+    required: true
+  vars-json:
+    description: toJSON(vars) del workflow.
+    required: true
+  auth0-client-id:
+    required: false
+    default: ''
+  auth0-client-secret:
+    required: false
+    default: ''
+
+outputs:
+  plan-args:
+    description: Argumentos extra del plan ('-refresh=false' en un PR con Auth0).
+    value: ${{ steps.creds.outputs.plan-args }}
+
+runs:
+  using: composite
+  steps:
+    - id: creds
+      shell: bash
+      env:
+        NF_ENV: ${{ inputs.environment }}
+        NF_DIR: ${{ inputs.working-directory }}
+        NF_MODE: ${{ inputs.mode }}
+        VARS_JSON: ${{ inputs.vars-json }}
+        NF_AUTH0_ID: ${{ inputs.auth0-client-id }}
+        NF_AUTH0_SECRET: ${{ inputs.auth0-client-secret }}
+      run: '"$GITHUB_ACTION_PATH/credentials.sh"'
