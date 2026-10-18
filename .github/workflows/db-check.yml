@@ -1,0 +1,64 @@
+# Workflow reutilizable de NanoFlow: revisa las migraciones Postgres de un PR
+# del repo dueño de una base (doc 11 §14 de la consola, E5-D10). No usa
+# credenciales de AWS ni de NanoFlow: todo corre contra un Postgres 16 efímero
+# del propio job. Sin `databases` en el manifiesto no hace nada.
+#
+#   on:
+#     pull_request:
+#       paths: ['db/**', '.nanoflow/deploy.yml']
+#   jobs:
+#     db-check:
+#       permissions:
+#         contents: read
+#       uses: groupware-nanoflow/nanoflow-actions/.github/workflows/db-check.yml@v1
+#       with:
+#         audience: nanoflow-dev
+name: NanoFlow db check
+
+on:
+  workflow_call:
+    inputs:
+      audience:
+        description: Audiencia OIDC de NanoFlow (elige el bucket público del migrador).
+        required: true
+        type: string
+      manifest:
+        required: false
+        type: string
+        default: .nanoflow/deploy.yml
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      migrator-version:
+        required: false
+        type: string
+        default: 1.1.0
+
+jobs:
+  check:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # La rama base hace falta para comprobar que nada ya mergeado cambió.
+          fetch-depth: 0
+
+      - uses: groupware-nanoflow/nanoflow-actions/actions/db-check@v1
+        with:
+          audience: ${{ inputs.audience }}
+          manifest: ${{ inputs.manifest }}
+          migrator-version: ${{ inputs.migrator-version }}
+          pg-admin-url: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable

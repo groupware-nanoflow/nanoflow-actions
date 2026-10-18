@@ -1,0 +1,72 @@
+name: NanoFlow db check
+description: >
+  Revisa las migraciones de un PR sin tocar ninguna base real: lint de
+  nanoflow-db-migrator (nombres, numeración, inmutabilidad contra la rama base,
+  kind declarado), squawk sobre las nuevas, apply desde cero en un Postgres
+  efímero y aislamiento por tenant con multiTenancy pool. Necesita el Postgres
+  del job (pg-admin-url) y el historial de la rama base (checkout con
+  fetch-depth 0). Lo usa el workflow reutilizable db-check.yml.
+
+inputs:
+  audience:
+    description: Audiencia OIDC de NanoFlow, p. ej. nanoflow-dev. Elige el bucket público del migrador.
+    required: true
+  manifest:
+    description: Manifiesto de despliegue (lista `databases`).
+    required: false
+    default: .nanoflow/deploy.yml
+  pg-admin-url:
+    description: URL de superusuario del Postgres efímero.
+    required: true
+  migrator-version:
+    description: Versión de nanoflow-db-migrator.
+    required: false
+    default: 1.1.0
+  migrator-base-url:
+    description: Base de descarga del migrador. Vacío = https://<audience>-public.s3.amazonaws.com/db-migrator
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Herramientas
+      id: tools
+      shell: bash
+      env:
+        NF_AUDIENCE: ${{ inputs.audience }}
+        MIGRATOR_VERSION: ${{ inputs.migrator-version }}
+        MIGRATOR_BASE_URL: ${{ inputs.migrator-base-url }}
+        # squawk 2.66.0, fijado por checksum (doc 11 §14, E5-D10).
+        SQUAWK_URL: https://github.com/sbdchd/squawk/releases/download/v2.66.0/squawk-linux-x64
+        SQUAWK_SHA256: e7965f8146b53cfa7a4625ceecfea5c6aeb35add39132210aa60b11ae180b9f4
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/nf-db-check-bin"
+        mkdir -p "$bin"
+        if ! command -v yq >/dev/null 2>&1; then
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        fi
+        base="${MIGRATOR_BASE_URL:-https://${NF_AUDIENCE}-public.s3.amazonaws.com/db-migrator}"
+        base="${base%/}/${MIGRATOR_VERSION}"
+        curl -fsSL --max-time 120 --retry 3 -o "$bin/db-migrator" "$base/db-migrator-linux-amd64"
+        want=$(curl -fsSL --max-time 30 --retry 3 "$base/db-migrator-linux-amd64.sha256" | awk '{print $1; exit}')
+        echo "${want}  $bin/db-migrator" | sha256sum -c --quiet
+        curl -fsSL --max-time 120 --retry 3 -o "$bin/squawk" "$SQUAWK_URL"
+        echo "${SQUAWK_SHA256}  $bin/squawk" | sha256sum -c --quiet
+        chmod +x "$bin/db-migrator" "$bin/squawk"
+        command -v psql >/dev/null || { echo "::error::psql no está en el runner"; exit 1; }
+        echo "migrator=$bin/db-migrator" >> "$GITHUB_OUTPUT"
+        echo "squawk=$bin/squawk" >> "$GITHUB_OUTPUT"
+        echo "nanoflow-db-migrator ${MIGRATOR_VERSION} y $("$bin/squawk" --version)"
+
+    - name: Revisar migraciones
+      shell: bash
+      env:
+        MANIFEST: ${{ inputs.manifest }}
+        PG_ADMIN_URL: ${{ inputs.pg-admin-url }}
+        MIGRATOR_BIN: ${{ steps.tools.outputs.migrator }}
+        SQUAWK_BIN: ${{ steps.tools.outputs.squawk }}
+        BASE_REF: ${{ github.base_ref }}
+      run: '"$GITHUB_ACTION_PATH/check.sh"'

@@ -1,0 +1,54 @@
+name: NanoFlow db migrate
+description: >
+  Migra las bases Postgres que declara el manifiesto (`databases`) con la
+  Lambda migradora de cada una, en la cuenta AWS del ambiente, antes del
+  deploy. Instala la versión fijada de nanoflow-db-migrator, hace un snapshot
+  antes de un lote contract/destructive en staging y production, e informa el
+  resultado a NanoFlow. Sin `databases` no hace nada. Requiere credenciales AWS
+  del ambiente y las variables NF_DB_<NOMBRE>_MIGRATOR del GitHub Environment.
+
+inputs:
+  api-url:
+    description: Base del API de NanoFlow (para el reporte). Vacío = no informar.
+    required: false
+    default: ''
+  audience:
+    description: Audiencia OIDC de NanoFlow, p. ej. nanoflow-dev. También elige el bucket público del migrador.
+    required: true
+  manifest:
+    description: Manifiesto de despliegue.
+    required: false
+    default: .nanoflow/deploy.yml
+  environment:
+    description: Ambiente que resolvió NanoFlow para la rama (development, staging, production).
+    required: true
+  migrator-version:
+    description: Versión de nanoflow-db-migrator que se instala en la Lambda.
+    required: false
+    default: 1.1.0
+  migrator-base-url:
+    description: Base de descarga del migrador. Vacío = https://<audience>-public.s3.amazonaws.com/db-migrator
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: skipped (sin bases), succeeded o failed.
+    value: ${{ steps.migrate.outputs.status }}
+  error:
+    description: "<base>: <código> cuando falla."
+    value: ${{ steps.migrate.outputs.error }}
+
+runs:
+  using: composite
+  steps:
+    - id: migrate
+      shell: bash
+      env:
+        MANIFEST: ${{ inputs.manifest }}
+        NF_ENVIRONMENT: ${{ inputs.environment }}
+        NF_API_URL: ${{ inputs.api-url }}
+        NF_AUDIENCE: ${{ inputs.audience }}
+        MIGRATOR_VERSION: ${{ inputs.migrator-version }}
+        MIGRATOR_BASE_URL: ${{ inputs.migrator-base-url }}
+      run: '"$GITHUB_ACTION_PATH/migrate.sh"'

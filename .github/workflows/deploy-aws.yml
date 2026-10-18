@@ -325,6 +325,23 @@ jobs:
           echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
           exit "$rc"
 
+      # Migraciones antes del código (doc 11 §14 de la consola): si el
+      # manifiesto declara `databases`, cada base se migra con su Lambda
+      # migradora (bootstrap, snapshot si hay contract/destructive fuera de
+      # development, apply) y se informa a NanoFlow. Si falla, no hay deploy:
+      # todo lo que llega es expand/migrate, así que el código anterior sigue
+      # funcionando con el esquema que quedó. Sin `databases` no hace nada.
+      - name: Migraciones
+        id: migrate
+        # Incluye la espera del snapshot previo a un lote contract/destructive.
+        timeout-minutes: 75
+        uses: groupware-nanoflow/nanoflow-actions/actions/db-migrate@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          manifest: ${{ inputs.manifest }}
+          environment: ${{ steps.aws.outputs.environment }}
+
       - name: Deploy
         id: deploy
         timeout-minutes: 30
@@ -353,6 +370,8 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           BUILD_EXIT: ${{ steps.build.outputs.exit-code }}
+          MIGRATE_OUTCOME: ${{ steps.migrate.outcome }}
+          MIGRATE_ERROR: ${{ steps.migrate.outputs.error }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           DEPLOY_EXIT: ${{ steps.deploy.outputs.exit-code }}
           URL: ${{ steps.commands.outputs.url }}
@@ -366,6 +385,8 @@ jobs:
           if [ "$status" = "failure" ]; then
             if [ "$BUILD_OUTCOME" = "failure" ]; then
               error="build: exit ${BUILD_EXIT:-?}"
+            elif [ "$MIGRATE_OUTCOME" = "failure" ]; then
+              error="migrate: ${MIGRATE_ERROR:-falló}"
             elif [ "$DEPLOY_OUTCOME" = "failure" ]; then
               error="deploy: exit ${DEPLOY_EXIT:-?}"
             else

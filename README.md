@@ -89,6 +89,59 @@ el de la rama; si no, falla. El `deploy.yml` que genera NanoFlow ya lo pasa:
       environment: ${{ github.ref_name == 'develop' && 'development' || github.ref_name == 'main' && 'production' || '' }}
 ```
 
+### Bases Postgres (`databases`)
+
+Si el repositorio es dueño de una base Postgres de la arquitectura
+(`data[].owner`), el manifiesto la declara y `deploy-aws` la migra **después
+del build y antes del deploy** (doc 11 §14 de la consola):
+
+```yaml
+databases:
+  - name: app-db              # data[].name de la arquitectura
+    migrations: db/migrations # NNNN_<slug>.sql, por defecto db/migrations
+```
+
+El paso «Migraciones» (acción `db-migrate`) hace lo siguiente por cada base:
+1. Encuentra su Lambda migradora en `NF_DB_<NOMBRE>_MIGRATOR`. Es una variable del contrato de
+   plataforma que NanoFlow escribe solo en el repo dueño.
+2. Instala en ella la versión fijada de `nanoflow-db-migrator`, desde el bucket público de
+   NanoFlow y verificada por sha256.
+3. Corre `bootstrap` y luego `status` para conocer las pendientes.
+4. En staging y production, si alguna pendiente es `contract` o `destructive`, crea un **snapshot**
+   de la base y espera a que esté disponible.
+5. Corre `apply` con el commit del push.
+6. Informa a NanoFlow (`POST /v1/ci/migrations`): el resultado y el estado completo del esquema.
+
+Si una migración falla, no hay deploy y el despliegue queda con el error `migrate: <base>:
+<código>`. Todo lo que llega es `expand` o `migrate`, así que el código anterior sigue
+funcionando con el esquema que quedó. El reporte nunca hace fallar el paso. Sin `databases`, el
+paso no hace nada.
+
+**En los PRs**, el workflow reutilizable `db-check.yml` revisa las migraciones sin tocar ninguna
+base real. Lo hace contra un Postgres 16 del propio job y sin credenciales de AWS ni de NanoFlow:
+- `db-migrator lint`:
+  - nombres y numeración;
+  - las migraciones de la rama base no se editan, borran ni renombran;
+  - `-- nanoflow:kind` obligatorio y no menor que lo que hace el SQL.
+- **squawk** 2.66.0 sobre las migraciones nuevas. Las reglas de drop y rename solo se permiten en
+  un `contract` o `destructive` declarado.
+- **apply desde cero.**
+- **Aislamiento por tenant** (RLS forzado, `tenant_id NOT NULL`, policies), si la arquitectura
+  dice `multiTenancy: pool`.
+
+```yaml
+on:
+  pull_request:
+    paths: ['db/**', '.nanoflow/deploy.yml']
+jobs:
+  db-check:
+    permissions:
+      contents: read
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/db-check.yml@v1
+    with:
+      audience: nanoflow-dev
+```
+
 ## Qué ve NanoFlow del despliegue
 
 El workflow reutilizable informa a NanoFlow mientras corre, con el mismo token
@@ -251,4 +304,6 @@ versión compatible. Un cambio que rompa el contrato sale como una etiqueta
 nueva y los repos se migran cuando toque, no a la fuerza. `@v2` agrega los
 workflows de Terraform y las acciones `report-plan`, `report-outputs` e
 `infra-env`. `deploy-aws.yml` agregó el input opcional `environment` y la clave
-`env-map` sin romper a quien no los usa, así que siguió en `@v1`.
+`env-map` sin romper a quien no los usa, así que siguió en `@v1`; lo mismo
+la clave `databases` (paso «Migraciones», acción `db-migrate`) y el workflow
+`db-check.yml`.
