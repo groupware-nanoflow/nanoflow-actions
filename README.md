@@ -102,13 +102,19 @@ databases:
 ```
 
 El paso «Migraciones» (acción `db-migrate`) hace lo siguiente por cada base:
-1. Encuentra su Lambda migradora en `NF_DB_<NOMBRE>_MIGRATOR`. Es una variable del contrato de
+1. Encuentra su migrador en `NF_DB_<NOMBRE>_MIGRATOR`. Es una variable del contrato de
    plataforma que NanoFlow escribe solo en el repo dueño.
-2. Instala en ella la versión fijada de `nanoflow-db-migrator`, desde el bucket público de
-   NanoFlow y verificada por sha256.
+2. Instala la versión fijada de `nanoflow-db-migrator`, desde el bucket público de NanoFlow y
+   verificada por sha256:
+   - **RDS/Aurora**: la variable es el nombre de la Lambda migradora de la VPC, y el código va a
+     esa Lambda.
+   - **Supabase** (doc 11 §19): la variable es el ARN del secreto `admin` de la base. La CLI corre
+     en el runner con la conexión del session pooler y la contraseña de `app_rw`, que lee de los
+     secretos `admin` y `app` de la cuenta del ambiente. Ambas se enmascaran.
 3. Corre `bootstrap` y luego `status` para conocer las pendientes.
 4. En staging y production, si alguna pendiente es `contract` o `destructive`, crea un **snapshot**
-   de la base y espera a que esté disponible.
+   de la base y espera a que esté disponible. En Supabase no hay snapshot desde el pipeline: deja
+   un aviso para verificar los backups/PITR del proyecto.
 5. Corre `apply` con el commit del push.
 6. Informa a NanoFlow (`POST /v1/ci/migrations`): el resultado y el estado completo del esquema.
 
@@ -302,6 +308,17 @@ jobs:
   el motivo.
 - trivy se descarga de su release y se verifica contra los checksums
   publicados; no se usan acciones de terceros para eso.
+- **Credenciales de proveedores externos** (acción `provider-credentials`, doc 11
+  §18 y §19). Las carga el usuario en NanoFlow, que las sincroniza en el repo:
+  - **Auth0**, si el ambiente usa el provider `auth0/auth0`: dominio en la
+    variable de repo `NF_AUTH0_DOMAIN_<AMBIENTE>`, client M2M en los secretos
+    `AUTH0_CLIENT_ID`/`AUTH0_CLIENT_SECRET` del GitHub Environment. Un PR no ve
+    esos secretos: su plan corre con `-refresh=false`.
+  - **Supabase**, por cada `var.supabase["<base>"]`: proyecto en la variable de
+    repo `NF_SUPABASE_<AMBIENTE>_<BASE>` (`TF_VAR_supabase`) y contraseña en el
+    secreto `SUPABASE_DB_PASSWORD_<BASE>` del environment (variable efímera
+    `TF_VAR_supabase_passwords`, solo en apply y drift: apply y drift le pasan
+    `toJSON(secrets)` y la acción toma solo esos nombres).
 - `report-plan` y `report-outputs` nunca fallan el job: si NanoFlow no responde, dejan un aviso. Un repo sin el output `nanoflow_contract` (templates < 0.6.0) se salta sin aviso de error.
 - `report-plan` acepta `has-changes` (`true`/`false`, el veredicto de
   `-detailed-exitcode`) y lo envía como `hasChanges`. NanoFlow solo lo usa si

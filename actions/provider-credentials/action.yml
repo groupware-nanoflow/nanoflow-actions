@@ -1,13 +1,17 @@
 name: NanoFlow provider credentials
 description: >
-  Credenciales de los proveedores externos que configura Terraform (hoy Auth0,
-  doc 11 §18 de la consola). Si el ambiente usa el provider auth0/auth0, toma
-  el dominio de la variable de repo NF_AUTH0_DOMAIN_<AMBIENTE> y el client M2M
-  de los secretos AUTH0_CLIENT_ID y AUTH0_CLIENT_SECRET del GitHub Environment
-  (los carga el usuario en NanoFlow), y los deja en el entorno de los pasos
-  siguientes. Un PR no corre en el environment y no ve esos secretos: el plan
-  del PR usa credenciales vacías y `-refresh=false` (el apply vuelve a planear
-  con refresh y el drift diario lo detecta). Sin auth0 no hace nada.
+  Credenciales de los proveedores externos que configura Terraform (Auth0 y
+  Supabase, doc 11 §18 y §19 de la consola; las carga el usuario en NanoFlow).
+  Auth0: si el ambiente usa el provider auth0/auth0, toma el dominio de la
+  variable de repo NF_AUTH0_DOMAIN_<AMBIENTE> y el client M2M de los secretos
+  AUTH0_CLIENT_ID y AUTH0_CLIENT_SECRET del GitHub Environment. Un PR no corre
+  en el environment y no ve esos secretos: su plan usa credenciales vacías y
+  `-refresh=false` (el apply vuelve a planear con refresh y el drift diario lo
+  detecta). Supabase: por cada var.supabase["<base>"] del ambiente, arma
+  TF_VAR_supabase con las variables de repo NF_SUPABASE_<AMBIENTE>_<BASE> y,
+  fuera de un PR, la variable efímera TF_VAR_supabase_passwords con los
+  secretos SUPABASE_DB_PASSWORD_<BASE> del environment. Sin ninguno de los dos
+  no hace nada.
 
 inputs:
   environment:
@@ -28,6 +32,10 @@ inputs:
   auth0-client-secret:
     required: false
     default: ''
+  secrets-json:
+    description: toJSON(secrets) del job del environment (apply y drift). La acción solo lee SUPABASE_DB_PASSWORD_<BASE> y los enmascara.
+    required: false
+    default: '{}'
 
 outputs:
   plan-args:
@@ -46,4 +54,5 @@ runs:
         VARS_JSON: ${{ inputs.vars-json }}
         NF_AUTH0_ID: ${{ inputs.auth0-client-id }}
         NF_AUTH0_SECRET: ${{ inputs.auth0-client-secret }}
+        SECRETS_JSON: ${{ inputs.secrets-json }}
       run: '"$GITHUB_ACTION_PATH/credentials.sh"'

@@ -3,12 +3,17 @@
 # deploy (doc 11 §14 de la consola, E5-D1 a E5-D7).
 #
 # Por cada `databases[]` de .nanoflow/deploy.yml:
-#   1. Encuentra su Lambda migradora en NF_DB_<NOMBRE>_MIGRATOR (contrato de
+#   1. Encuentra su migrador en NF_DB_<NOMBRE>_MIGRATOR (contrato de
 #      plataforma; solo existe en el repo dueño de la base).
-#   2. Le instala el código de nanoflow-db-migrator de la versión fijada, si no
-#      es ya ese (zip del bucket público de NanoFlow, verificado por sha256).
+#   2. RDS/Aurora: es una Lambda en la VPC; le instala el código de
+#      nanoflow-db-migrator de la versión fijada, si no es ya ese (zip del
+#      bucket público de NanoFlow, verificado por sha256).
+#      Supabase (doc 11 §19 E9-D6): es el ARN del secreto admin; la CLI del
+#      migrador (misma versión, verificada por sha256) corre en el runner con
+#      DATABASE_URL y APP_DB_PASSWORD leídos de los secretos admin y app.
 #   3. bootstrap → status (pendientes) → snapshot si en staging/production hay
-#      una pendiente contract o destructive → apply → status (estado completo).
+#      una pendiente contract o destructive (no en Supabase: avisa) → apply →
+#      status (estado completo).
 #   4. Informa el resultado a NanoFlow (POST /v1/ci/migrations). El reporte
 #      nunca hace fallar el paso; una migración fallida sí.
 #
@@ -57,23 +62,43 @@ fi
 # ---------------------------------------------------------------- el migrador
 base_url="${MIGRATOR_BASE_URL:-https://${NF_AUDIENCE:?NF_AUDIENCE vacío}-public.s3.amazonaws.com/db-migrator}"
 base_url="${base_url%/}/${MIGRATOR_VERSION}"
+
+# fetch <archivo>: descarga un artefacto del migrador y lo verifica contra su
+# .sha256. Deja el sha256 en $fetched_hex.
+fetched_hex=""
+fetch() {
+  local f="$work/$1" got
+  if ! curl -fsSL --max-time 120 --retry 3 -o "$f" "$base_url/$1" ||
+     ! curl -fsSL --max-time 30 --retry 3 -o "$f.sha256" "$base_url/$1.sha256"; then
+    echo "::error::No se pudo descargar nanoflow-db-migrator ${MIGRATOR_VERSION} ($1) de ${base_url}."
+    out "status=failed"; out "error=migrator: download"
+    exit 1
+  fi
+  fetched_hex=$(awk '{print $1; exit}' "$f.sha256")
+  got=$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | awk '{print $1}')
+  if ! [[ "$fetched_hex" =~ ^[0-9a-f]{64}$ ]] || [ "$fetched_hex" != "$got" ]; then
+    echo "::error::$1 de nanoflow-db-migrator ${MIGRATOR_VERSION} no coincide con su .sha256."
+    out "status=failed"; out "error=migrator: checksum"
+    exit 1
+  fi
+  echo "nanoflow-db-migrator ${MIGRATOR_VERSION}: $1 (sha256 ${fetched_hex:0:12}…)"
+}
+
+# El zip de la Lambda y la CLI se bajan solo si alguna base los necesita.
 zip="$work/db-migrator-lambda-arm64.zip"
-if ! curl -fsSL --max-time 120 --retry 3 -o "$zip" "$base_url/db-migrator-lambda-arm64.zip" ||
-   ! curl -fsSL --max-time 30 --retry 3 -o "$zip.sha256" "$base_url/db-migrator-lambda-arm64.zip.sha256"; then
-  echo "::error::No se pudo descargar nanoflow-db-migrator ${MIGRATOR_VERSION} de ${base_url}."
-  out "status=failed"; out "error=migrator: download"
-  exit 1
-fi
-want_hex=$(awk '{print $1; exit}' "$zip.sha256")
-got_hex=$( (sha256sum "$zip" 2>/dev/null || shasum -a 256 "$zip") | awk '{print $1}')
-if ! [[ "$want_hex" =~ ^[0-9a-f]{64}$ ]] || [ "$want_hex" != "$got_hex" ]; then
-  echo "::error::El zip de nanoflow-db-migrator ${MIGRATOR_VERSION} no coincide con su .sha256."
-  out "status=failed"; out "error=migrator: checksum"
-  exit 1
-fi
-# Lambda informa CodeSha256 como base64 del sha256 binario.
-want_b64=$(printf '%s' "$want_hex" | xxd -r -p | base64)
-echo "nanoflow-db-migrator ${MIGRATOR_VERSION} (sha256 ${want_hex:0:12}…)"
+want_b64=""
+ensure_zip() {
+  [ -z "$want_b64" ] || return 0
+  fetch db-migrator-lambda-arm64.zip
+  # Lambda informa CodeSha256 como base64 del sha256 binario.
+  want_b64=$(printf '%s' "$fetched_hex" | xxd -r -p | base64)
+}
+cli="$work/db-migrator-linux-amd64"
+ensure_cli() {
+  [ ! -x "$cli" ] || return 0
+  fetch db-migrator-linux-amd64
+  chmod +x "$cli"
+}
 
 # ---------------------------------------------------------------- utilidades
 # invoke <función> <payload.json> <respuesta.json>: invocación síncrona. Si la
@@ -93,6 +118,64 @@ invoke() {
     msg=$(jq -r '.errorMessage // "respuesta inválida"' "$resp" 2>/dev/null | head -c 400 || echo "respuesta inválida")
     jq -n --arg m "$msg" '{ok: false, applied: [], pending: [], error: {code: "INVOKE_FAILED", message: ("la Lambda falló: " + $m)}}' > "$resp"
   fi
+}
+
+# migrator <acción> <con archivos: yes|no> <respuesta.json>: corre una acción
+# del migrador de la base actual: invoca la Lambda ($fn) o, en Supabase, la CLI
+# en el runner con DATABASE_URL/APP_DB_PASSWORD del entorno del subshell.
+# Usa $files (lista [{name, sql}]) y $dir.
+migrator() {
+  local action="$1" with_files="$2" resp="$3" rc
+  if [ "$runner" = false ]; then
+    if [ "$with_files" = yes ]; then
+      jq -c --arg a "$action" --arg sha "${GITHUB_SHA:-}" '{action: $a, files: .} + (if $a == "apply" then {sha: $sha} else {} end)' "$files" > "$work/p.json"
+    else
+      jq -cn --arg a "$action" '{action: $a}' > "$work/p.json"
+    fi
+    invoke "$fn" "$work/p.json" "$resp"
+    return
+  fi
+  local cmd=("$cli" "$action")
+  if [ "$with_files" = yes ]; then cmd+=(--dir "$dir"); fi
+  if [ "$action" = apply ]; then cmd+=(--sha "${GITHUB_SHA:-}"); fi
+  set +e
+  DATABASE_URL="$db_url" APP_DB_PASSWORD="$app_password" "${cmd[@]}" > "$resp" 2> "$work/cli.err"
+  rc=$?
+  set -e
+  if ! jq -e 'type == "object" and has("ok")' "$resp" >/dev/null 2>&1; then
+    jq -n --arg m "$(tail -c 400 "$work/cli.err" | tr '\n' ' ')" --arg rc "$rc" \
+      '{ok: false, applied: [], pending: [], error: {code: "INVOKE_FAILED", message: ("la CLI del migrador falló (código " + $rc + "): " + $m)}}' > "$resp"
+  fi
+}
+
+# supabase_env <arn del secreto admin>: lee los secretos admin y app de la
+# cuenta del ambiente y deja $db_url y $app_password (enmascarados). Corre en
+# este shell (las máscaras van a su stdout); si falla, el motivo queda en
+# $work/sb.err.
+supabase_env() {
+  local arn="$1" region admin app app_arn user pw
+  region=$(cut -d: -f4 <<< "$arn")
+  if ! admin=$(aws secretsmanager get-secret-value --region "$region" --secret-id "$arn" --query SecretString --output text 2> "$work/sm.err"); then
+    echo "no se pudo leer el secreto admin: $(tail -c 300 "$work/sm.err" | tr '\n' ' ')" > "$work/sb.err"; return 1
+  fi
+  if ! jq -e '.engine == "supabase" and (.username | type == "string") and (.password | type == "string" and length > 0) and (.host | type == "string") and (.appSecretArn | type == "string")' <<< "$admin" >/dev/null 2>&1; then
+    echo "el secreto admin no tiene la forma de Supabase o le falta la contraseña (cárgala en NanoFlow → Infraestructura → ${NF_ENVIRONMENT} → Datos y aplica core-infra)" > "$work/sb.err"; return 1
+  fi
+  pw=$(jq -r '.password' <<< "$admin")
+  echo "::add-mask::${pw}"
+  db_url=$(jq -r '"postgresql://\(.username | @uri):\(.password | @uri)@\(.host):\(.port // 5432)/\(.dbname // "postgres" | @uri)?sslmode=\(if (.sslmode // "") | IN("disable", "verify-ca", "verify-full") then .sslmode else "require" end)"' <<< "$admin")
+  echo "::add-mask::${db_url}"
+  app_arn=$(jq -r '.appSecretArn' <<< "$admin")
+  if ! app=$(aws secretsmanager get-secret-value --region "$(cut -d: -f4 <<< "$app_arn")" --secret-id "$app_arn" --query SecretString --output text 2> "$work/sm.err"); then
+    echo "no se pudo leer el secreto app: $(tail -c 300 "$work/sm.err" | tr '\n' ' ')" > "$work/sb.err"; return 1
+  fi
+  app_password=$(jq -r '.password // ""' <<< "$app" 2>/dev/null || true)
+  if [ -z "$app_password" ]; then
+    echo "el secreto app no tiene contraseña" > "$work/sb.err"; return 1
+  fi
+  echo "::add-mask::${app_password}"
+  user=$(jq -r '.username' <<< "$admin")
+  echo "Supabase: ${user} en $(jq -r '.host' <<< "$admin") por el session pooler."
 }
 
 # kind_of <archivo>: el `-- nanoflow:kind` del encabezado (unknown si falta).
@@ -242,21 +325,34 @@ for i in $(seq 0 $((count - 1))); do
   fi
   echo "::group::${db} (${fn})"
 
-  # Código del migrador.
-  if ! cfg=$(aws lambda get-function-configuration --function-name "$fn" 2> "$work/cfg.err"); then
-    echo "::endgroup::"
-    fail MIGRATOR_NOT_FOUND "no se pudo leer la Lambda ${fn}: $(tail -c 300 "$work/cfg.err" | tr '\n' ' ')"; break
-  fi
-  if [ "$(jq -r '.CodeSha256' <<< "$cfg")" != "$want_b64" ]; then
-    echo "Instalando nanoflow-db-migrator ${MIGRATOR_VERSION} en ${fn}"
-    if ! aws lambda update-function-code --function-name "$fn" --zip-file "fileb://$zip" >/dev/null 2> "$work/cfg.err" ||
-       ! aws lambda wait function-updated-v2 --function-name "$fn" 2> "$work/cfg.err"; then
+  db_identifier=""; db_cluster=false; db_url=""; app_password=""
+  if [[ "$fn" =~ ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret: ]]; then
+    # Supabase: la CLI en el runner con los secretos de la cuenta del ambiente.
+    runner=true
+    ensure_cli
+    if ! supabase_env "$fn"; then
       echo "::endgroup::"
-      fail MIGRATOR_UPDATE_FAILED "no se pudo instalar el migrador en ${fn}: $(tail -c 300 "$work/cfg.err" | tr '\n' ' ')"; break
+      fail MIGRATOR_NOT_FOUND "$(cat "$work/sb.err")"; break
     fi
+  else
+    runner=false
+    ensure_zip
+    # Código del migrador.
+    if ! cfg=$(aws lambda get-function-configuration --function-name "$fn" 2> "$work/cfg.err"); then
+      echo "::endgroup::"
+      fail MIGRATOR_NOT_FOUND "no se pudo leer la Lambda ${fn}: $(tail -c 300 "$work/cfg.err" | tr '\n' ' ')"; break
+    fi
+    if [ "$(jq -r '.CodeSha256' <<< "$cfg")" != "$want_b64" ]; then
+      echo "Instalando nanoflow-db-migrator ${MIGRATOR_VERSION} en ${fn}"
+      if ! aws lambda update-function-code --function-name "$fn" --zip-file "fileb://$zip" >/dev/null 2> "$work/cfg.err" ||
+         ! aws lambda wait function-updated-v2 --function-name "$fn" 2> "$work/cfg.err"; then
+        echo "::endgroup::"
+        fail MIGRATOR_UPDATE_FAILED "no se pudo instalar el migrador en ${fn}: $(tail -c 300 "$work/cfg.err" | tr '\n' ' ')"; break
+      fi
+    fi
+    db_identifier=$(jq -r '.Environment.Variables.DB_IDENTIFIER // ""' <<< "$cfg")
+    db_cluster=$(jq -r '.Environment.Variables.DB_CLUSTER // "false"' <<< "$cfg")
   fi
-  db_identifier=$(jq -r '.Environment.Variables.DB_IDENTIFIER // ""' <<< "$cfg")
-  db_cluster=$(jq -r '.Environment.Variables.DB_CLUSTER // "false"' <<< "$cfg")
 
   # Archivos (no recursivo, por nombre) como [{name, sql}].
   files="$work/files.json"
@@ -269,15 +365,13 @@ for i in $(seq 0 $((count - 1))); do
 
   if [ "$MODE" = drift ]; then
     # Solo lectura: status con los archivos de la rama.
-    jq -c '{action: "status", files: .}' "$files" > "$work/p.json"
-    invoke "$fn" "$work/p.json" "$work/drift.json"
+    migrator status yes "$work/drift.json"
     if jq -e '.ok' "$work/drift.json" >/dev/null; then
       if [ "$(jq '.pending | length' "$work/drift.json")" -gt 0 ]; then drift=pending; else drift=in_sync; fi
       state="$work/drift.json"
     elif [ "$(jq -r '.error.code' "$work/drift.json")" = "CHECKSUM_MISMATCH" ]; then
       drift=mismatch
-      echo '{"action":"status"}' > "$work/p.json"
-      invoke "$fn" "$work/p.json" "$work/after.json"
+      migrator status no "$work/after.json"
       state="$work/after.json"
     else
       drift=""; state=""
@@ -294,8 +388,7 @@ for i in $(seq 0 $((count - 1))); do
   fi
 
   # 1) bootstrap
-  echo '{"action":"bootstrap"}' > "$work/p.json"
-  invoke "$fn" "$work/p.json" "$work/bootstrap.json"
+  migrator bootstrap no "$work/bootstrap.json"
   if ! jq -e '.ok' "$work/bootstrap.json" >/dev/null; then
     echo "::endgroup::"
     report "$db" "$work/bootstrap.json" "" ""
@@ -303,12 +396,11 @@ for i in $(seq 0 $((count - 1))); do
   fi
 
   # 2) status con los archivos → pendientes
-  jq -c '{action: "status", files: .}' "$files" > "$work/p.json"
-  if [ "$(wc -c < "$work/p.json")" -gt "$MAX_PAYLOAD_BYTES" ]; then
+  if [ "$runner" = false ] && [ "$(jq -c '{action: "status", files: .}' "$files" | wc -c)" -gt "$MAX_PAYLOAD_BYTES" ]; then
     echo "::endgroup::"
     fail PAYLOAD_TOO_LARGE "las migraciones de ${dir} pesan más de 6 MB (límite de Lambda)"; break
   fi
-  invoke "$fn" "$work/p.json" "$work/before.json"
+  migrator status yes "$work/before.json"
   if ! jq -e '.ok' "$work/before.json" >/dev/null; then
     echo "::endgroup::"
     report "$db" "$work/before.json" "" ""
@@ -326,7 +418,10 @@ for i in $(seq 0 $((count - 1))); do
       k=$([ -n "$f" ] && kind_of "$f" || echo unknown)
       case "$k" in contract|destructive) risky="${risky} ${v}(${k})" ;; esac
     done
-    if [ -n "$risky" ]; then
+    if [ -n "$risky" ] && [ "$runner" = true ]; then
+      # AWS no puede crear un snapshot de Supabase (E9-D6).
+      echo "::warning::${db}: hay migraciones${risky} en ${NF_ENVIRONMENT} y Supabase no admite snapshot desde el pipeline. Verifica antes los backups/PITR del proyecto Supabase."
+    elif [ -n "$risky" ]; then
       if [ -z "$db_identifier" ]; then
         echo "::endgroup::"
         fail SNAPSHOT_FAILED "hay migraciones${risky} y la Lambda no trae DB_IDENTIFIER (regenera core-infra con templates ≥ 0.9.0)"; break
@@ -342,12 +437,10 @@ for i in $(seq 0 $((count - 1))); do
   fi
 
   # 4) apply
-  jq -c --arg sha "${GITHUB_SHA:-}" '{action: "apply", files: ., sha: $sha}' "$files" > "$work/p.json"
-  invoke "$fn" "$work/p.json" "$work/apply.json"
+  migrator apply yes "$work/apply.json"
 
   # 5) estado completo para NanoFlow (si falla, se informa sin estado)
-  echo '{"action":"status"}' > "$work/p.json"
-  invoke "$fn" "$work/p.json" "$work/after.json"
+  migrator status no "$work/after.json"
   echo "::endgroup::"
   report "$db" "$work/apply.json" "$work/after.json" "$snap"
 

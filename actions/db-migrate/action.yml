@@ -1,11 +1,14 @@
 name: NanoFlow db migrate
 description: >
-  Migra las bases Postgres que declara el manifiesto (`databases`) con la
-  Lambda migradora de cada una, en la cuenta AWS del ambiente, antes del
-  deploy. Instala la versión fijada de nanoflow-db-migrator, hace un snapshot
-  antes de un lote contract/destructive en staging y production, e informa el
-  resultado a NanoFlow. Sin `databases` no hace nada. Requiere credenciales AWS
-  del ambiente y las variables NF_DB_<NOMBRE>_MIGRATOR del GitHub Environment.
+  Migra las bases Postgres que declara el manifiesto (`databases`) antes del
+  deploy: RDS/Aurora con la Lambda migradora de cada una en la cuenta AWS del
+  ambiente; Supabase con la CLI del migrador en el runner, leyendo los
+  secretos admin y app de esa cuenta (doc 11 §19). Instala la versión fijada
+  de nanoflow-db-migrator, hace un snapshot antes de un lote
+  contract/destructive en staging y production (en Supabase solo avisa), e
+  informa el resultado a NanoFlow. Sin `databases` no hace nada. Requiere
+  credenciales AWS del ambiente y las variables NF_DB_<NOMBRE>_MIGRATOR del
+  GitHub Environment.
 
 inputs:
   api-url:

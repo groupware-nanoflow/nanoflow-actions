@@ -114,6 +114,7 @@ jobs:
           vars-json: ${{ toJSON(vars) }}
           auth0-client-id: ${{ secrets.AUTH0_CLIENT_ID }}
           auth0-client-secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          secrets-json: ${{ toJSON(secrets) }}
 
       - name: Init
         id: init
