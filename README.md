@@ -180,10 +180,14 @@ OIDC de las credenciales:
    `failure` (con el paso y el código de salida, p. ej. `deploy: exit 1`) o
    `cancelled`, y la `url` del manifiesto si salió bien.
 
-Ninguno de los dos puede fallar el despliegue. Si NanoFlow no responde, el log
-en vivo se descarta con un único `::warning::` al final del paso y el reporte
-deja otro aviso; el log completo sigue en GitHub y NanoFlow lo archiva al
-terminar el job. Para no reenviar la salida, `live-logs: false`.
+Ninguno de los dos puede fallar el despliegue. Si NanoFlow deja de responder
+(tres lotes seguidos sin llegar, o un rechazo 401/403/404), el log en vivo hace
+una pausa —30 s, o 60 s ante un rechazo—, lo avisa en ese momento con un
+`::warning::` y vuelve a intentar; las líneas esperan en cola (hasta 20 000) y,
+cuando la API vuelve, se envían y un `::notice::` lo dice. Lo que no llegue antes
+de que termine el paso se descarta con un `::warning::` final, y el reporte deja
+otro aviso; el log completo sigue en GitHub y NanoFlow lo archiva al terminar el
+job. Para no reenviar la salida, `live-logs: false`.
 
 El ambiente tampoco aquí lo manda el workflow: NanoFlow lo deriva de la rama
 firmada en el token, igual que las credenciales.

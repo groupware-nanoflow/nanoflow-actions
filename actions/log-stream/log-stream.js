@@ -12,8 +12,10 @@
 // Tres reglas que mandan sobre todo lo demás:
 //
 //   1. Nunca falla ni bloquea el comando. Sale siempre con 0 (con pipefail, un
-//      código distinto de 0 aquí fallaría un build que salió bien), y si la API
-//      no responde descarta lo pendiente con un único ::warning:: al final.
+//      código distinto de 0 aquí fallaría un build que salió bien). Si la API
+//      deja de responder, no se rinde: guarda las líneas en cola, avisa con un
+//      ::warning:: en ese momento, espera y vuelve a intentar; al recuperarse
+//      envía lo acumulado. Al final, un ::warning:: solo si algo se perdió.
 //   2. Redacta ANTES de enviar. ::add-mask:: solo afecta al log que guarda
 //      GitHub; lo que llega por la tubería es la salida cruda del comando.
 //   3. Sin dependencias: corre con el node que traen los runners (≥ 20, fetch
@@ -40,12 +42,21 @@ const PARTIAL_BYTES = 64 * 1024;
 const MAX_QUEUED_LINES = 20000;
 // Tiempo total para vaciar lo pendiente al cerrarse stdin.
 const CLOSE_DEADLINE_MS = 10000;
-const REQUEST_TIMEOUT_MS = 5000;
+// Una API lenta (arranque en frío, pooler de la base) no es una API caída.
+const REQUEST_TIMEOUT_MS = 10000;
 const TOKEN_TTL_MS = 4 * 60 * 1000;
-// Reintentos por lote: 0,5 s · 1 s · 2 s. Tres lotes seguidos perdidos y se deja
-// de intentar: seguir esperando a una API caída solo alargaría el build.
+// Reintentos por lote: 0,5 s · 1 s · 2 s.
 const RETRY_DELAYS_MS = [500, 1000, 2000];
+// Tres lotes seguidos sin llegar (cada uno tras sus reintentos) y se hace una
+// pausa antes de volver a intentar; las líneas esperan en la cola. Antes se
+// dejaba de enviar para siempre: en un apply largo, tres respuestas lentas
+// seguidas congelaban el log en vivo hasta el final del paso.
 const MAX_CONSECUTIVE_FAILURES = 3;
+const OUTAGE_PAUSE_MS = 30 * 1000;
+// Un rechazo (401 aun con token nuevo, 403, 404) puede ser pasajero (la API sin
+// sus claves de GitHub un momento, el catálogo actualizándose): se reintenta
+// también, con más calma.
+const REFUSED_PAUSE_MS = 60 * 1000;
 // Un valor enmascarado de menos de 4 caracteres taparía medio log sin proteger
 // nada.
 const MIN_SECRET_LENGTH = 4;
@@ -209,9 +220,6 @@ class Sender {
     this.wait = wait;
     this.token = '';
     this.tokenAt = 0;
-    // disabled: la API dijo que no va a aceptar nada de este run (repositorio
-    // fuera del catálogo, token rechazado dos veces). No tiene sentido seguir.
-    this.disabled = false;
     this.lastError = '';
   }
 
@@ -230,10 +238,13 @@ class Sender {
     return this.token;
   }
 
-  // send devuelve true si el lote quedó guardado y false si se descartó. Nunca
-  // lanza.
+  // send devuelve cómo terminó el lote. Nunca lanza.
+  //   'ok'          guardado.
+  //   'rejected'    la API no lo quiere (400, 413): reintentarlo no lo arregla.
+  //   'unavailable' no llegó tras sus reintentos (red, timeout, 429, 5xx, token
+  //                 OIDC): el lote sigue siendo bueno.
+  //   'refused'     401 aun con token nuevo, 403 o 404: no lo acepta ahora.
   async send(payload, deadline = Infinity) {
-    if (this.disabled) return false;
     const body = JSON.stringify(payload);
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
@@ -246,7 +257,7 @@ class Sender {
           body,
           signal: AbortSignal.timeout(Math.max(1, Math.min(REQUEST_TIMEOUT_MS, deadline - this.now()))),
         });
-        if (res.status >= 200 && res.status < 300) return true;
+        if (res.status >= 200 && res.status < 300) return 'ok';
         this.lastError = `HTTP ${res.status}`;
         if (res.status === 401 && !refreshed) {
           // El token pudo caducar entre la caché y el envío: uno nuevo, una vez.
@@ -254,20 +265,21 @@ class Sender {
           this.token = '';
           retry = true;
         } else if (res.status === 401 || res.status === 403 || res.status === 404) {
-          this.disabled = true;
-          return false;
+          // El siguiente intento (tras la pausa) pide un token nuevo.
+          this.token = '';
+          return 'refused';
         } else if (res.status === 429 || res.status >= 500) {
           retry = true;
         } else {
-          return false; // 400, 413: reintentar el mismo lote no lo arregla
+          return 'rejected'; // 400, 413
         }
       } catch (err) {
         this.lastError = err && err.message ? err.message : String(err);
         retry = true;
       }
-      if (!retry || attempt >= RETRY_DELAYS_MS.length) return false;
+      if (!retry || attempt >= RETRY_DELAYS_MS.length) return 'unavailable';
       const delay = RETRY_DELAYS_MS[attempt];
-      if (this.now() + delay >= deadline) return false;
+      if (this.now() + delay >= deadline) return 'unavailable';
       await this.wait(delay);
     }
   }
@@ -279,7 +291,8 @@ class LogStream {
   constructor({
     job, step, stepNumber, checkRunId, sender, redactor,
     startN = 0, flushMs = FLUSH_MS, batchLines = BATCH_LINES, batchBytes = BATCH_BYTES,
-    now = Date.now,
+    now = Date.now, notify = () => {},
+    outagePauseMs = OUTAGE_PAUSE_MS, refusedPauseMs = REFUSED_PAUSE_MS,
   }) {
     this.job = job;
     this.step = step;
@@ -299,21 +312,29 @@ class LogStream {
     this.failures = 0;
     this.sent = 0;
     this.dropped = 0;
+    // notify imprime un comando de workflow (::warning::, ::notice::) en el log
+    // del paso en el momento: el corte y la vuelta del log en vivo se ven en
+    // GitHub mientras pasan, no solo al terminar.
+    this.notify = notify;
+    this.outagePauseMs = outagePauseMs;
+    this.refusedPauseMs = refusedPauseMs;
+    // Durante una pausa no se envía; las líneas esperan en la cola.
+    this.pausedUntil = 0;
+    this.resumeTimer = null;
+    this.outage = false;
+    this.outageLines = 0;
   }
 
   get active() {
-    return Boolean(this.sender) && !this.sender.disabled && this.failures < MAX_CONSECUTIVE_FAILURES;
+    return Boolean(this.sender);
   }
 
   // push recibe una línea ya impresa. La numera siempre (aunque no se envíe) para
   // que n siga siendo la posición real de la línea en el paso.
   push(text) {
     this.n++;
+    if (!this.active) return;
     const redacted = this.redactor.redact(text);
-    if (!this.active) {
-      if (this.sender) this.dropped++;
-      return;
-    }
     if (this.queue.length >= MAX_QUEUED_LINES) {
       this.dropped++;
       return;
@@ -352,37 +373,80 @@ class LogStream {
   }
 
   // kick arranca un envío si no hay uno en curso. Uno a la vez: el orden de los
-  // lotes se conserva y una API lenta no recibe una avalancha.
-  kick(deadline = Infinity) {
+  // lotes se conserva y una API lenta no recibe una avalancha. final (el
+  // cierre) ignora la pausa pero no insiste: un fallo y se termina.
+  kick(deadline = Infinity, final = false) {
     if (this.sending) return this.sending;
-    this.sending = (async () => {
+    const run = async () => {
       try {
         while (this.queue.length > 0 && this.active && this.now() < deadline) {
+          if (!final && this.now() < this.pausedUntil) {
+            this.scheduleResume();
+            break;
+          }
           const lines = this.takeBatch();
           this.inflight = lines.length;
-          const ok = await this.sender.send(this.payload(lines), deadline);
+          const result = await this.sender.send(this.payload(lines), deadline);
           this.inflight = 0;
-          if (ok) {
+          if (result === 'ok') {
             this.sent += lines.length;
             this.failures = 0;
-          } else {
+            this.recovered();
+          } else if (result === 'rejected') {
             this.dropped += lines.length;
+            this.failures = 0;
+          } else {
+            // El lote vuelve al principio de la cola: llegará tras la pausa.
+            this.queue.unshift(...lines);
+            if (final) break;
             this.failures++;
+            if (result === 'refused') this.pause(this.refusedPauseMs);
+            else if (this.failures >= MAX_CONSECUTIVE_FAILURES) this.pause(this.outagePauseMs);
           }
-        }
-        if (!this.active || this.now() >= deadline) {
-          this.dropped += this.queue.length;
-          this.queue = [];
         }
       } catch {
         this.dropped += this.queue.length + this.inflight;
         this.inflight = 0;
         this.queue = [];
-      } finally {
-        this.sending = null;
       }
-    })();
-    return this.sending;
+    };
+    // La marca se limpia DESPUÉS de asignarla: un ciclo que no espera nada (en
+    // pausa) termina síncrono, y un `finally` dentro de run la limpiaría antes
+    // de la asignación, dejando `sending` ocupado para siempre.
+    const sending = run().finally(() => {
+      if (this.sending === sending) this.sending = null;
+    });
+    this.sending = sending;
+    return sending;
+  }
+
+  // pause deja de enviar durante ms y lo avisa una vez por corte.
+  pause(ms) {
+    this.pausedUntil = this.now() + ms;
+    this.failures = 0;
+    if (!this.outage) {
+      this.outage = true;
+      const why = this.sender.lastError ? ` (${this.sender.lastError})` : '';
+      this.notify(`::warning::El log en vivo de ${this.job}/${this.step} no llega a NanoFlow${why}. ` +
+        `Se reintenta cada ${Math.round(ms / 1000)} s y las líneas esperan en cola; el log completo sigue en GitHub.`);
+    }
+    this.scheduleResume();
+  }
+
+  scheduleResume() {
+    if (this.resumeTimer) return;
+    const ms = Math.max(0, this.pausedUntil - this.now());
+    this.resumeTimer = setTimeout(() => {
+      this.resumeTimer = null;
+      this.kick();
+    }, ms);
+    this.resumeTimer.unref?.();
+  }
+
+  recovered() {
+    if (!this.outage) return;
+    this.outage = false;
+    this.notify(`::notice::El log en vivo de ${this.job}/${this.step} volvió a llegar a NanoFlow; se envía lo acumulado.`);
   }
 
   // close vacía lo pendiente, con un tope total. Lo que no llegue a tiempo se
@@ -392,6 +456,10 @@ class LogStream {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    if (this.resumeTimer) {
+      clearTimeout(this.resumeTimer);
+      this.resumeTimer = null;
+    }
     const deadline = this.now() + deadlineMs;
     let guard;
     const timeout = new Promise((resolve) => {
@@ -399,9 +467,13 @@ class LogStream {
       // se imprima el aviso) si la petición en vuelo nunca termina.
       guard = setTimeout(resolve, deadlineMs);
     });
+    // Un último intento aunque haya pausa, hasta el tope; si falla, se acaba.
     const drain = (async () => {
-      while (this.sending || (this.queue.length > 0 && this.active)) {
-        await (this.sending || this.kick(deadline));
+      if (this.sending) await this.sending;
+      while (this.queue.length > 0 && this.active && this.now() < deadline) {
+        const before = this.queue.length;
+        await this.kick(deadline, true);
+        if (this.queue.length >= before) break;
       }
     })();
     await Promise.race([drain, timeout]);
@@ -463,6 +535,12 @@ function main() {
 
   let stream = null;
   let counter = '';
+  let endsWithNewline = true;
+  // Un comando de workflow solo se reconoce al principio de una línea.
+  const notify = (text) => {
+    stdout.write(`${endsWithNewline ? '' : '\n'}${text}\n`);
+    endsWithNewline = true;
+  };
   try {
     if (streamingEnabled(env, args)) {
       counter = counterFile(env.RUNNER_TEMP, args.job, args.step);
@@ -474,6 +552,7 @@ function main() {
         sender: new Sender({ apiUrl: env.NF_API_URL, audience: env.NF_AUDIENCE, env }),
         redactor: new Redactor(env),
         startN: readCounter(counter),
+        notify,
       });
     } else if (env.NF_API_URL && !env.ACTIONS_ID_TOKEN_REQUEST_URL) {
       stdout.write("::debug::log-stream en modo solo-eco: el job no tiene 'permissions: id-token: write'.\n");
@@ -502,7 +581,6 @@ function main() {
   process.on('SIGINT', shorten);
   process.on('SIGTERM', shorten);
 
-  let endsWithNewline = true;
   process.stdin.on('data', (chunk) => {
     // El eco va primero y en crudo: GitHub ve exactamente lo que vería sin el
     // filtro. Con contrapresión, para no acumular en memoria.

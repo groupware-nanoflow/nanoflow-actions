@@ -105,17 +105,21 @@ test('pasa a solo-eco sin API, sin audiencia, sin id-token o con live-logs apaga
 
 // --- agrupado y numeración ---------------------------------------------------
 
-function fakeSender({ fail = false } = {}) {
+// results: lo que devuelve cada envío en orden; cuando se acaban, `then`.
+function fakeSender({ fail = false, results = [], then } = {}) {
   return {
-    disabled: false,
     lastError: fail ? 'HTTP 503' : '',
     batches: [],
+    results: [...results],
     async send(payload) {
       this.batches.push(JSON.parse(JSON.stringify(payload)));
-      return !fail;
+      if (this.results.length > 0) return this.results.shift();
+      return then || (fail ? 'unavailable' : 'ok');
     },
   };
 }
+
+const tick = (ms) => new Promise((r) => setTimeout(r, ms));
 
 test('agrupa de a 200 líneas y numera desde 1 por paso', async () => {
   const sender = fakeSender();
@@ -193,19 +197,69 @@ test('continúa la numeración de una invocación anterior del mismo paso', () =
   assert.equal(s.n, 18);
 });
 
-test('si la API no acepta, descarta y deja un único aviso', async () => {
+test('si la API no responde, pausa, avisa en el momento y entrega lo acumulado al volver', async () => {
+  const notes = [];
+  const sender = fakeSender({ results: ['unavailable', 'unavailable', 'unavailable'], then: 'ok' });
+  sender.lastError = 'The operation was aborted due to timeout';
+  const s = new LogStream({ job: 'apply', step: 'apply', sender, redactor: new Redactor({}), flushMs: 5,
+    outagePauseMs: 40, notify: (t) => notes.push(t) });
+  for (let i = 0; i < 5; i++) s.push(`l${i}`);
+  await tick(20);
+  // Tres envíos fallidos del mismo lote y la pausa: nada se perdió.
+  assert.equal(sender.batches.length, 3);
+  assert.equal(s.queue.length, 5);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], /^::warning::El log en vivo de apply\/apply no llega a NanoFlow \(The operation was aborted due to timeout\)\. Se reintenta cada 0 s/);
+  // Durante la pausa siguen llegando líneas: esperan en la cola.
+  s.push('l5');
+  await tick(80);
+  assert.equal(s.queue.length, 0);
+  assert.equal(s.dropped, 0);
+  assert.deepEqual(sender.batches.at(-1).lines.map((l) => l.text), ['l0', 'l1', 'l2', 'l3', 'l4', 'l5']);
+  assert.equal(notes.length, 2);
+  assert.match(notes[1], /^::notice::El log en vivo de apply\/apply volvió a llegar a NanoFlow/);
+  await s.close(100);
+  assert.equal(s.warning(), '', 'sin pérdidas no hay aviso final');
+});
+
+test('un rechazo (401, 403, 404) pausa más tiempo y se reintenta', async () => {
+  const notes = [];
+  const sender = fakeSender({ results: ['refused'], then: 'ok' });
+  sender.lastError = 'HTTP 404';
+  const s = new LogStream({ job: 'j', step: 's', sender, redactor: new Redactor({}), flushMs: 5,
+    outagePauseMs: 1000, refusedPauseMs: 30, notify: (t) => notes.push(t) });
+  s.push('a');
+  await tick(15);
+  assert.equal(sender.batches.length, 1, 'un rechazo pausa de inmediato');
+  assert.match(notes[0], /\(HTTP 404\)/);
+  await tick(60);
+  assert.equal(sender.batches.length, 2);
+  assert.equal(s.sent, 1);
+});
+
+test('un lote que la API no quiere (400, 413) se descarta y se sigue', async () => {
+  const sender = fakeSender({ results: ['rejected'], then: 'ok' });
+  const s = new LogStream({ job: 'j', step: 's', sender, redactor: new Redactor({}), flushMs: 60000, batchLines: 2 });
+  for (const t of ['a', 'b', 'c']) s.push(t);
+  await s.close(1000);
+  assert.equal(s.dropped, 2);
+  assert.equal(s.sent, 1);
+});
+
+test('si la API sigue caída al cerrar, descarta lo pendiente y deja un único aviso final', async () => {
+  const notes = [];
   const sender = fakeSender({ fail: true });
-  const s = new LogStream({ job: 'deploy', step: 'build', sender, redactor: new Redactor({}), flushMs: 60000 });
+  const s = new LogStream({ job: 'deploy', step: 'build', sender, redactor: new Redactor({}), flushMs: 60000,
+    notify: (t) => notes.push(t) });
   for (let i = 0; i < 1000; i++) s.push(`l${i}`);
   await s.close(1000);
-  // Tres lotes perdidos seguidos y deja de intentarlo.
-  assert.equal(sender.batches.length, 3);
   assert.equal(s.dropped, 1000);
   assert.match(s.warning(), /^::warning::NanoFlow no recibió 1000 líneas del log en vivo de deploy\/build \(HTTP 503\)/);
+  assert.ok(notes.length <= 1, 'a lo sumo el aviso del corte');
 });
 
 test('el cierre no espera más que su tope', async () => {
-  const sender = { disabled: false, lastError: '', send: () => new Promise(() => {}) };
+  const sender = { lastError: '', send: () => new Promise(() => {}) };
   const s = new LogStream({ job: 'j', step: 's', sender, redactor: new Redactor({}) });
   s.push('a');
   const started = Date.now();
@@ -237,8 +291,8 @@ test('Sender pide el token con la audiencia, lo cachea y reintenta con backoff',
     fetchImpl,
     wait: async (ms) => { waits.push(ms); },
   });
-  assert.equal(await sender.send({ job: 'j', step: 's', lines: [] }), true);
-  assert.equal(await sender.send({ job: 'j', step: 's', lines: [] }), true);
+  assert.equal(await sender.send({ job: 'j', step: 's', lines: [] }), 'ok');
+  assert.equal(await sender.send({ job: 'j', step: 's', lines: [] }), 'ok');
 
   const tokenCalls = calls.filter(([u]) => u.startsWith('https://token'));
   assert.equal(tokenCalls.length, 1, 'el token se cachea');
@@ -249,12 +303,25 @@ test('Sender pide el token con la audiencia, lo cachea y reintenta con backoff',
   assert.deepEqual(waits, [500]);
 });
 
-test('Sender deja de enviar si el repositorio no está en el catálogo', async () => {
-  const fetchImpl = async (url) => (url.startsWith('https://token') ? response(200, { value: 't' }) : response(404));
+test('Sender: un 404 es un rechazo, pero no se queda apagado', async () => {
+  let posts = 0;
+  let tokens = 0;
+  const fetchImpl = async (url) => {
+    if (url.startsWith('https://token')) return response(200, { value: `t${++tokens}` });
+    return ++posts === 1 ? response(404) : response(202);
+  };
   const sender = new Sender({ apiUrl: 'https://api', audience: 'a', env: { ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token?x', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'r' }, fetchImpl, wait: async () => {} });
-  assert.equal(await sender.send({}), false);
-  assert.equal(sender.disabled, true);
-  assert.equal(await sender.send({}), false);
+  assert.equal(await sender.send({}), 'refused');
+  assert.equal(sender.lastError, 'HTTP 404');
+  assert.equal(await sender.send({}), 'ok');
+  assert.equal(tokens, 2, 'tras un rechazo se pide un token nuevo');
+});
+
+test('Sender: 400 es un lote rechazado y 5xx tras los reintentos, no disponible', async () => {
+  const mk = (status) => new Sender({ apiUrl: 'https://api', audience: 'a', env: { ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token?x', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'r' },
+    fetchImpl: async (url) => (url.startsWith('https://token') ? response(200, { value: 't' }) : response(status)), wait: async () => {} });
+  assert.equal(await mk(400).send({}), 'rejected');
+  assert.equal(await mk(503).send({}), 'unavailable');
 });
 
 test('Sender renueva el token una vez ante un 401', async () => {
@@ -265,13 +332,13 @@ test('Sender renueva el token una vez ante un 401', async () => {
     return ++posts === 1 ? response(401) : response(202);
   };
   const sender = new Sender({ apiUrl: 'https://api', audience: 'a', env: { ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token?x', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'r' }, fetchImpl, wait: async () => {} });
-  assert.equal(await sender.send({}), true);
+  assert.equal(await sender.send({}), 'ok');
   assert.equal(tokens, 2);
 });
 
 test('Sender nunca lanza aunque la red falle', async () => {
   const sender = new Sender({ apiUrl: 'https://api', audience: 'a', env: { ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token?x', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'r' }, fetchImpl: async () => { throw new Error('ECONNREFUSED'); }, wait: async () => {} });
-  assert.equal(await sender.send({}), false);
+  assert.equal(await sender.send({}), 'unavailable');
   assert.equal(sender.lastError, 'ECONNREFUSED');
 });
 
