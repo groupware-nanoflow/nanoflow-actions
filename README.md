@@ -115,7 +115,10 @@ El paso «Migraciones» (acción `db-migrate`) hace lo siguiente por cada base:
 4. En staging y production, si alguna pendiente es `contract` o `destructive`, crea un **snapshot**
    de la base y espera a que esté disponible. En Supabase no hay snapshot desde el pipeline: deja
    un aviso para verificar los backups/PITR del proyecto.
-5. Corre `apply` con el commit del push.
+5. Corre `apply` con el commit del push. Antes de ejecutar nada, el migrador (1.2.0+) rechaza los
+   nombres inválidos y los objetos fuera del schema `app` (`INVALID_NAME`, `SCHEMA_NOT_APP`: las
+   migraciones corren como `app_owner`, dueño solo de `app`) y deja un `::warning::` por cada
+   migración sin cabecera `-- nanoflow:kind` (se aplica como `unknown`).
 6. Informa a NanoFlow (`POST /v1/ci/migrations`): el resultado y el estado completo del esquema.
 
 Si una migración falla, no hay deploy y el despliegue queda con el error `migrate: <base>:
@@ -127,6 +130,7 @@ paso no hace nada.
 base real. Lo hace contra un Postgres 16 del propio job y sin credenciales de AWS ni de NanoFlow:
 - `db-migrator lint`:
   - nombres y numeración;
+  - todo objeto en el schema `app` y calificado (`SCHEMA_NOT_APP`);
   - las migraciones de la rama base no se editan, borran ni renombran;
   - `-- nanoflow:kind` obligatorio y no menor que lo que hace el SQL.
 - **squawk** 2.66.0 sobre las migraciones nuevas. Las reglas de drop y rename solo se permiten en

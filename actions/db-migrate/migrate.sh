@@ -449,6 +449,8 @@ for i in $(seq 0 $((count - 1))); do
     break
   fi
   n=$(jq '.applied | length' "$work/apply.json")
+  # Avisos del migrador (1.2.0+): p. ej. una migración sin `-- nanoflow:kind`.
+  while IFS= read -r w; do [ -n "$w" ] && echo "::warning::${db}: ${w}"; done < <(jq -r '.warnings[]?' "$work/apply.json")
   version=$(jq -r 'if .ok then ([.applied[]?.version] | last // "—") else "?" end' "$work/after.json" 2>/dev/null || echo "?")
   echo "${db}: ${n} aplicadas; esquema en ${version}."
   summary="${summary}| ${db} | ✓ ${n} aplicadas | ${version}${snap:+ · snapshot ${snap}} |"$'\n'

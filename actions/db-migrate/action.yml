@@ -32,7 +32,7 @@ inputs:
   migrator-version:
     description: Versión de nanoflow-db-migrator que se instala en la Lambda.
     required: false
-    default: 1.1.0
+    default: 1.2.0
   migrator-base-url:
     description: Base de descarga del migrador. Vacío = https://<audience>-public.s3.amazonaws.com/db-migrator
     required: false
