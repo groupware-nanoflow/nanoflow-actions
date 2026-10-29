@@ -7,6 +7,10 @@
 # trust del rol de APPLY acepta; y el environment solo admite su rama. Se
 # planea de nuevo y se aplica ese plan guardado (nunca `-auto-approve` sobre
 # un plan no guardado). El despliegue se informa a NanoFlow como cualquier otro.
+#
+# Un ambiente que NanoFlow destruyó (variable de repo NF_INFRA_DESTROYED_<AMBIENTE>,
+# doc 29) no se aplica: el push no lo recrea hasta que se vuelve a construir la
+# infraestructura desde NanoFlow.
 name: NanoFlow terraform apply
 
 on:
@@ -40,6 +44,7 @@ jobs:
       contents: read
     outputs:
       found: ${{ steps.env.outputs.found }}
+      destroyed: ${{ steps.destroyed.outputs.destroyed }}
       environment: ${{ steps.env.outputs.environment }}
       dir: ${{ steps.env.outputs.dir }}
       region: ${{ steps.env.outputs.region }}
@@ -52,10 +57,16 @@ jobs:
         with:
           branch: ${{ github.ref_name }}
           config: ${{ inputs.config }}
+      - id: destroyed
+        if: steps.env.outputs.found == 'true'
+        uses: groupware-nanoflow/nanoflow-actions/actions/infra-destroyed@v2
+        with:
+          environment: ${{ steps.env.outputs.environment }}
+          vars-json: ${{ toJSON(vars) }}
 
   apply:
     needs: resolve
-    if: needs.resolve.outputs.found == 'true'
+    if: needs.resolve.outputs.found == 'true' && needs.resolve.outputs.destroyed != 'true'
     runs-on: ${{ inputs.runs-on }}
     environment: ${{ needs.resolve.outputs.environment }}
     # Un apply colgado falla en minutos (y se informa), no a las 6 horas.
@@ -68,6 +79,15 @@ jobs:
       group: nanoflow-terraform-apply-${{ github.repository }}-${{ needs.resolve.outputs.environment }}
       cancel-in-progress: false
     steps:
+      # Otra vez, ya dentro del grupo de concurrencia: si NanoFlow confirmó una
+      # destrucción mientras este apply esperaba, no se recrea nada.
+      - name: El ambiente no se está destruyendo
+        uses: groupware-nanoflow/nanoflow-actions/actions/infra-destroyed@v2
+        with:
+          environment: ${{ needs.resolve.outputs.environment }}
+          vars-json: ${{ toJSON(vars) }}
+          fail: 'true'
+
       - uses: actions/checkout@v4
 
       - uses: hashicorp/setup-terraform@v3

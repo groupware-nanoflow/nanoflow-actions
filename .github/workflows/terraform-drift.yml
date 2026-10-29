@@ -7,7 +7,9 @@
 # la trust del rol de plan solo acepta `pull_request` o `environment:<env>`.
 # El resultado llega a NanoFlow (report-plan) con `hasChanges`. Encontrar drift
 # NO falla el job: es información que NanoFlow muestra. Solo falla si el plan
-# falla. Sin fmt, tflint, trivy ni comentario de PR.
+# falla. Sin fmt, tflint, trivy ni comentario de PR. Un ambiente que NanoFlow
+# destruyó (NF_INFRA_DESTROYED_<AMBIENTE>, doc 29) no se revisa: el job pasa con
+# un aviso.
 name: NanoFlow terraform drift
 
 on:
@@ -83,12 +85,21 @@ jobs:
             exit 1
           fi
 
+      - name: Ambiente destruido
+        id: destroyed
+        uses: groupware-nanoflow/nanoflow-actions/actions/infra-destroyed@v2
+        with:
+          environment: ${{ inputs.environment }}
+          vars-json: ${{ toJSON(vars) }}
+
       - uses: hashicorp/setup-terraform@v3
+        if: steps.destroyed.outputs.destroyed != 'true'
         with:
           terraform_version: ${{ steps.env.outputs.terraform-version }}
           terraform_wrapper: false
 
       - name: Credenciales de plan
+        if: steps.destroyed.outputs.destroyed != 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ steps.env.outputs.plan-role-arn }}
@@ -96,6 +107,7 @@ jobs:
           aws-region: ${{ steps.env.outputs.region }}
 
       - name: Preparar el log en vivo
+        if: steps.destroyed.outputs.destroyed != 'true'
         uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v2
         with:
           api-url: ${{ inputs.api-url }}
@@ -106,6 +118,7 @@ jobs:
       # Proveedores externos (Auth0): el job corre en el environment y ve sus
       # secretos, así que el drift sí refresca contra Auth0.
       - name: Credenciales de proveedores externos
+        if: steps.destroyed.outputs.destroyed != 'true'
         uses: groupware-nanoflow/nanoflow-actions/actions/provider-credentials@v2
         with:
           environment: ${{ steps.env.outputs.environment }}
@@ -118,6 +131,7 @@ jobs:
 
       - name: Init
         id: init
+        if: steps.destroyed.outputs.destroyed != 'true'
         timeout-minutes: 10
         uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
         with:
@@ -162,7 +176,7 @@ jobs:
 
       - name: Informar el plan
         id: report
-        if: always() && steps.env.outputs.found == 'true' && steps.env.outputs.environment == inputs.environment
+        if: always() && steps.env.outputs.found == 'true' && steps.env.outputs.environment == inputs.environment && steps.destroyed.outputs.destroyed != 'true'
         uses: groupware-nanoflow/nanoflow-actions/actions/report-plan@v2
         with:
           api-url: ${{ inputs.api-url }}

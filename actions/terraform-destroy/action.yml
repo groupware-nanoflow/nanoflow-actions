@@ -1,0 +1,84 @@
+name: NanoFlow terraform destroy
+description: >
+  La parte de AWS de terraform-destroy.yml (doc 29 de la consola): a partir del
+  estado de Terraform (`terraform show -json`), inventaría lo que tiene datos
+  antes de confirmar (rol de plan, solo lectura), quita las protecciones y
+  vacía lo que impide destruir (rol de apply), y limpia lo que queda fuera del
+  estado después del destroy. Corre destroy.js con la salida en vivo (como
+  terraform-run). Nunca imprime valores del estado.
+
+inputs:
+  command:
+    description: inventory | prepare | cleanup | result
+    required: true
+  working-directory:
+    description: Directorio de Terraform del ambiente (prepare saca del estado las llaves KMS que se conservan).
+    required: true
+  state-json:
+    description: "`terraform show -json` del estado (inventory y prepare: el actual; cleanup y result: el de antes del destroy)."
+    required: true
+  plan-json:
+    description: "`terraform show -json` del plan -destroy (solo inventory)."
+    required: false
+    default: ''
+  remaining:
+    description: Salida de `terraform state list` después del destroy (cleanup y result).
+    required: false
+    default: ''
+  keep-snapshots:
+    description: "'true' conserva un snapshot de cada base, los de pre-migración y sus llaves KMS."
+    required: false
+    default: 'false'
+  prepare-json:
+    description: Salida de prepare (result).
+    required: false
+    default: ''
+  cleanup-json:
+    description: Salida de cleanup (result).
+    required: false
+    default: ''
+  attempts:
+    description: Intentos de destroy que corrieron (result).
+    required: false
+    default: '0'
+  out:
+    description: Archivo JSON de salida.
+    required: true
+
+outputs:
+  file:
+    description: El archivo JSON escrito (el mismo que `out`)
+    value: ${{ steps.run.outputs.file }}
+
+runs:
+  using: composite
+  steps:
+    - id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        IN_COMMAND: ${{ inputs.command }}
+        IN_STATE: ${{ inputs.state-json }}
+        IN_PLAN: ${{ inputs.plan-json }}
+        IN_REMAINING: ${{ inputs.remaining }}
+        IN_KEEP: ${{ inputs.keep-snapshots }}
+        IN_PREPARE: ${{ inputs.prepare-json }}
+        IN_CLEANUP: ${{ inputs.cleanup-json }}
+        IN_ATTEMPTS: ${{ inputs.attempts }}
+        IN_OUT: ${{ inputs.out }}
+      run: |
+        set -euo pipefail
+        case "$IN_COMMAND" in inventory|prepare|cleanup|result) ;; *) echo "::error::comando desconocido: ${IN_COMMAND}"; exit 1 ;; esac
+        [[ "$IN_KEEP" =~ ^(true|false)$ ]] || { echo "::error::keep-snapshots debe ser true o false"; exit 1; }
+        [[ "$IN_ATTEMPTS" =~ ^[0-9]+$ ]] || { echo "::error::attempts debe ser un número"; exit 1; }
+        mkdir -p "$(dirname "$IN_OUT")"
+        args=(node "$GITHUB_ACTION_PATH/destroy.js" "$IN_COMMAND" "$IN_STATE")
+        [ "$IN_COMMAND" = inventory ] && args+=("$IN_PLAN")
+        args+=(--keep-snapshots "$IN_KEEP" --out "$IN_OUT")
+        [ -n "$IN_REMAINING" ] && args+=(--remaining "$IN_REMAINING")
+        [ -n "$IN_PREPARE" ] && args+=(--prepare "$IN_PREPARE")
+        [ -n "$IN_CLEANUP" ] && args+=(--cleanup "$IN_CLEANUP")
+        [ "$IN_COMMAND" = result ] && args+=(--attempts "$IN_ATTEMPTS")
+        # Con la salida en vivo de terraform-run (log-stream si el job lo preparó).
+        NF_CMD="$(printf '%q ' "${args[@]}")" NF_STEP="$IN_COMMAND" "$GITHUB_ACTION_PATH/../terraform-run/run.sh"
+        echo "file=$IN_OUT" >> "$GITHUB_OUTPUT"

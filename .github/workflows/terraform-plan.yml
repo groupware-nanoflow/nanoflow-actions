@@ -6,7 +6,8 @@
 # estado), asumido por OIDC nativo de GitHub: no pasa por NanoFlow y no puede
 # aplicar nada. El resultado llega a NanoFlow (report-plan) y al PR como
 # comentario. El check falla si fmt, validate, tflint, trivy (HIGH/CRITICAL) o
-# el plan fallan.
+# el plan fallan. Un ambiente que NanoFlow destruyó (NF_INFRA_DESTROYED_<AMBIENTE>,
+# doc 29) no se planea: el check pasa con un aviso hasta que se reconstruye.
 name: NanoFlow terraform plan
 
 on:
@@ -66,14 +67,22 @@ jobs:
           branch: ${{ github.base_ref || github.ref_name }}
           config: ${{ inputs.config }}
 
-      - uses: hashicorp/setup-terraform@v3
+      - name: Ambiente destruido
+        id: destroyed
         if: steps.env.outputs.found == 'true'
+        uses: groupware-nanoflow/nanoflow-actions/actions/infra-destroyed@v2
+        with:
+          environment: ${{ steps.env.outputs.environment }}
+          vars-json: ${{ toJSON(vars) }}
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         with:
           terraform_version: ${{ steps.env.outputs.terraform-version }}
           terraform_wrapper: false
 
       - name: Credenciales de plan
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ steps.env.outputs.plan-role-arn }}
@@ -81,7 +90,7 @@ jobs:
           aws-region: ${{ steps.env.outputs.region }}
 
       - name: Preparar el log en vivo
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v2
         with:
           api-url: ${{ inputs.api-url }}
@@ -91,12 +100,12 @@ jobs:
 
       - name: Formato
         id: fmt
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         run: terraform fmt -check -recursive -diff
 
       - name: Init y validate
         id: init
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         timeout-minutes: 10
         uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
         with:
@@ -105,13 +114,13 @@ jobs:
           command: terraform init -input=false -lock-timeout=5m && terraform validate -no-color
 
       - uses: terraform-linters/setup-tflint@v4
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         with:
           tflint_version: ${{ inputs.tflint-version }}
 
       - name: tflint
         id: tflint
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -122,7 +131,7 @@ jobs:
       # publicados: nada de acciones de terceros con permisos sobre el job.
       - name: trivy (HIGH y CRITICAL)
         id: trivy
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         continue-on-error: true
         shell: bash
         env:
@@ -144,7 +153,7 @@ jobs:
       # el plan va sin refresh (lo dice el aviso del paso).
       - name: Credenciales de proveedores externos
         id: creds
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         uses: groupware-nanoflow/nanoflow-actions/actions/provider-credentials@v2
         with:
           environment: ${{ steps.env.outputs.environment }}
@@ -154,7 +163,7 @@ jobs:
 
       - name: Plan
         id: plan
-        if: steps.env.outputs.found == 'true' && steps.init.outcome == 'success' && steps.creds.outcome == 'success'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true' && steps.init.outcome == 'success' && steps.creds.outcome == 'success'
         timeout-minutes: 20
         uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
         with:
@@ -164,7 +173,7 @@ jobs:
 
       - name: Informar el plan
         id: report
-        if: always() && steps.env.outputs.found == 'true'
+        if: always() && steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         uses: groupware-nanoflow/nanoflow-actions/actions/report-plan@v2
         with:
           api-url: ${{ inputs.api-url }}
@@ -205,7 +214,7 @@ jobs:
       # trivy no corta el job para que el plan y el reporte existan igual; aquí
       # se decide el check.
       - name: Resultado
-        if: steps.env.outputs.found == 'true'
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         shell: bash
         env:
           TRIVY: ${{ steps.trivy.outcome }}

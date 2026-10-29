@@ -1,0 +1,498 @@
+# Workflow reutilizable de NanoFlow: destruye la infraestructura de UN ambiente
+# del repo de infra de un proyecto (<proyecto>-core-infra). Doc 29 de la
+# consola, «Destruir la infraestructura de un ambiente».
+#
+# Lo despacha NanoFlow (workflow_dispatch del destroy.yml que NanoFlow pone en
+# el repo) en la rama del ambiente, en dos tiempos:
+#
+#   mode: plan     `terraform plan -destroy` con el rol de PLAN (solo lectura) y
+#                  un inventario de lo que tiene datos (bases y sus snapshots,
+#                  objetos, ítems, usuarios, registros DNS ajenos). La consola lo
+#                  muestra y el usuario confirma.
+#   mode: destroy  con el rol de APPLY: quita protecciones y vacía lo que impide
+#                  destruir (destroy.js prepare), hasta 3 × (credenciales nuevas,
+#                  plan -destroy + apply), limpia lo que queda fuera del estado
+#                  (destroy.js cleanup) e informa lo que quedó.
+#
+# El primer paso pregunta a NanoFlow (report-destroy, fase start) si hay una
+# destrucción en ese estado para este repo, rama, ambiente, modo e id: sin un 200
+# el job termina sin pedir credenciales de AWS. El job corre en el GitHub
+# Environment del ambiente: es lo único que aceptan las trust de los roles.
+name: NanoFlow terraform destroy
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: Base del API de NanoFlow.
+        required: true
+        type: string
+      audience:
+        description: Audiencia OIDC de NanoFlow, p. ej. nanoflow-dev.
+        required: true
+        type: string
+      environment:
+        description: Ambiente a destruir (development | staging | production). Debe ser el de la rama despachada.
+        required: true
+        type: string
+      mode:
+        description: plan (previsualizar) | destroy (destruir).
+        required: true
+        type: string
+      destroy-id:
+        description: Id de la destrucción en NanoFlow.
+        required: true
+        type: string
+      keep-snapshots:
+        description: Conservar un snapshot de cada base (y los de pre-migración, con su llave KMS).
+        required: false
+        type: boolean
+        default: false
+      config:
+        description: Configuración de ambientes que genera NanoFlow.
+        required: false
+        type: string
+        default: .nanoflow/infra.json
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      live-logs:
+        description: Reenviar a NanoFlow, en vivo, la salida de los pasos.
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  destroy:
+    runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
+    # Un destroy con CloudFront, RDS y ENIs de VPC puede pasar de una hora; tres
+    # intentos de 55 min más la preparación caben, y el job no llega a las 6 h.
+    timeout-minutes: 340
+    permissions:
+      contents: read
+      id-token: write
+    # El destroy comparte el grupo del apply: uno espera al otro y nunca se
+    # cancela uno en curso. El plan (solo lectura) va en su propio grupo: un
+    # apply que llega después no lo cancela mientras espera.
+    concurrency:
+      group: ${{ inputs.mode == 'destroy' && format('nanoflow-terraform-apply-{0}-{1}', github.repository, inputs.environment) || format('nanoflow-terraform-destroy-plan-{0}-{1}', github.repository, inputs.environment) }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolver el ambiente
+        id: env
+        uses: groupware-nanoflow/nanoflow-actions/actions/infra-env@v2
+        with:
+          branch: ${{ github.ref_name }}
+          config: ${{ inputs.config }}
+
+      - name: Verificar el ambiente
+        shell: bash
+        env:
+          NF_FOUND: ${{ steps.env.outputs.found }}
+          NF_RESOLVED: ${{ steps.env.outputs.environment }}
+          NF_EXPECTED: ${{ inputs.environment }}
+          NF_MODE: ${{ inputs.mode }}
+          NF_ID: ${{ inputs.destroy-id }}
+        run: |
+          case "$NF_MODE" in plan|destroy) ;; *) echo "::error::modo desconocido: ${NF_MODE} (plan | destroy)"; exit 1 ;; esac
+          if ! [[ "$NF_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::id de destrucción inválido"
+            exit 1
+          fi
+          if [ "$NF_FOUND" != "true" ]; then
+            echo "::error::La rama ${GITHUB_REF_NAME} no es la de ningún ambiente: la destrucción se despacha en la rama del ambiente ${NF_EXPECTED}."
+            exit 1
+          fi
+          if [ "$NF_RESOLVED" != "$NF_EXPECTED" ]; then
+            echo "::error::La rama ${GITHUB_REF_NAME} es la del ambiente ${NF_RESOLVED}, no la de ${NF_EXPECTED}."
+            exit 1
+          fi
+          # Los JSON de trabajo (estado, plan, inventario, resultado) quedan aquí.
+          mkdir -p "$RUNNER_TEMP/nf-destroy"
+          echo "NF_WORK=$RUNNER_TEMP/nf-destroy" >> "$GITHUB_ENV"
+
+      # Antes de cualquier credencial de AWS.
+      - name: Autorizar con NanoFlow
+        id: authorize
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-destroy@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          destroy-id: ${{ inputs.destroy-id }}
+          phase: start
+          mode: ${{ inputs.mode }}
+          environment: ${{ inputs.environment }}
+          keep-snapshots: ${{ inputs.keep-snapshots }}
+
+      - name: Preparar el log en vivo
+        uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          check-run-id: ${{ job.check_run_id }}
+          enabled: ${{ inputs.live-logs }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ steps.env.outputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Credenciales de plan
+        if: inputs.mode == 'plan'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.plan-role-arn }}
+          role-session-name: nanoflow-destroy-plan-${{ github.run_id }}
+          aws-region: ${{ steps.env.outputs.region }}
+
+      - name: Credenciales de apply
+        if: inputs.mode == 'destroy'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.apply-role-arn }}
+          role-session-name: nanoflow-destroy-${{ github.run_id }}
+          aws-region: ${{ steps.env.outputs.region }}
+
+      # El job corre en el environment y ve sus secretos: el plan refresca
+      # contra Auth0 como el drift, y el destroy puede borrar sus objetos.
+      - name: Credenciales de proveedores externos
+        uses: groupware-nanoflow/nanoflow-actions/actions/provider-credentials@v2
+        with:
+          environment: ${{ steps.env.outputs.environment }}
+          working-directory: ${{ steps.env.outputs.dir }}
+          mode: apply
+          vars-json: ${{ toJSON(vars) }}
+          auth0-client-id: ${{ secrets.AUTH0_CLIENT_ID }}
+          auth0-client-secret: ${{ secrets.AUTH0_CLIENT_SECRET }}
+          secrets-json: ${{ toJSON(secrets) }}
+
+      - name: Init
+        timeout-minutes: 10
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: init
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform init -input=false -lock-timeout=5m
+
+      # ---- mode: plan -----------------------------------------------------------
+
+      # Los JSON del plan y del estado traen valores sensibles: quedan en el
+      # runner; a NanoFlow solo va el resumen y el inventario.
+      - name: Plan de destrucción
+        id: plan
+        if: inputs.mode == 'plan'
+        timeout-minutes: 20
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: plan
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: >-
+            terraform plan -destroy -input=false -lock-timeout=5m -no-color -out=tfplan &&
+            terraform show -json tfplan > "$NF_WORK/plan.json" &&
+            terraform show -json > "$NF_WORK/state.json"
+
+      - name: Inventario
+        id: inventory
+        if: inputs.mode == 'plan' && steps.plan.outcome == 'success'
+        timeout-minutes: 15
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-destroy@v2
+        with:
+          command: inventory
+          working-directory: ${{ steps.env.outputs.dir }}
+          state-json: ${{ env.NF_WORK }}/state.json
+          plan-json: ${{ env.NF_WORK }}/plan.json
+          out: ${{ env.NF_WORK }}/plan-report.json
+
+      - name: Veredicto del plan
+        id: plan-verdict
+        if: always() && inputs.mode == 'plan' && steps.authorize.outcome == 'success'
+        shell: bash
+        env:
+          PLAN: ${{ steps.plan.outcome }}
+          INVENTORY: ${{ steps.inventory.outcome }}
+        run: |
+          status=failed code='' message=''
+          if [ "$PLAN" != success ]; then
+            code=TERRAFORM_PLAN_FAILED message='terraform plan -destroy falló: revisa el log del run.'
+          elif [ "$INVENTORY" != success ]; then
+            code=INVENTORY_FAILED message='El inventario de la destrucción falló: revisa el log del run.'
+          else
+            status=succeeded
+          fi
+          {
+            echo "status=${status}"
+            echo "code=${code}"
+            echo "message=${message}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Informar el plan
+        if: always() && inputs.mode == 'plan' && steps.authorize.outcome == 'success'
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-destroy@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          destroy-id: ${{ inputs.destroy-id }}
+          phase: plan
+          mode: plan
+          environment: ${{ inputs.environment }}
+          keep-snapshots: ${{ inputs.keep-snapshots }}
+          status: ${{ steps.plan-verdict.outputs.status || 'failed' }}
+          plan-file: ${{ steps.inventory.outcome == 'success' && format('{0}/plan-report.json', env.NF_WORK) || '' }}
+          error-code: ${{ steps.plan-verdict.outputs.code }}
+          error-message: ${{ steps.plan-verdict.outputs.message }}
+
+      # ---- mode: destroy --------------------------------------------------------
+
+      - name: Estado previo
+        id: pre
+        if: inputs.mode == 'destroy'
+        timeout-minutes: 5
+        working-directory: ${{ steps.env.outputs.dir }}
+        shell: bash
+        run: terraform show -json > "$NF_WORK/pre-state.json"
+
+      - name: Quitar protecciones y vaciar
+        id: prepare
+        if: inputs.mode == 'destroy' && steps.pre.outcome == 'success'
+        timeout-minutes: 120
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-destroy@v2
+        with:
+          command: prepare
+          working-directory: ${{ steps.env.outputs.dir }}
+          state-json: ${{ env.NF_WORK }}/pre-state.json
+          keep-snapshots: ${{ inputs.keep-snapshots }}
+          out: ${{ env.NF_WORK }}/prepare.json
+
+      # La sesión del rol dura 1 h: cada intento empieza con credenciales nuevas.
+      - name: Credenciales · intento 1
+        if: inputs.mode == 'destroy' && steps.prepare.outcome == 'success'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.apply-role-arn }}
+          role-session-name: nanoflow-destroy-${{ github.run_id }}-1
+          aws-region: ${{ steps.env.outputs.region }}
+
+      - name: Destroy · intento 1
+        id: d1
+        if: inputs.mode == 'destroy' && steps.prepare.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 55
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: destroy
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform plan -destroy -input=false -lock-timeout=5m -no-color -out=destroy.tfplan && terraform apply -input=false -lock-timeout=5m -no-color destroy.tfplan
+
+      # Entre intentos, tiempo para que AWS suelte las ENIs de las Lambdas en VPC
+      # y del origen VPC de CloudFront.
+      - name: Esperar · intento 2
+        if: inputs.mode == 'destroy' && steps.d1.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+
+      - name: Credenciales · intento 2
+        if: inputs.mode == 'destroy' && steps.d1.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.apply-role-arn }}
+          role-session-name: nanoflow-destroy-${{ github.run_id }}-2
+          aws-region: ${{ steps.env.outputs.region }}
+
+      - name: Destroy · intento 2
+        id: d2
+        if: inputs.mode == 'destroy' && steps.d1.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 55
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: destroy
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform plan -destroy -input=false -lock-timeout=5m -no-color -out=destroy.tfplan && terraform apply -input=false -lock-timeout=5m -no-color destroy.tfplan
+
+      - name: Esperar · intento 3
+        if: inputs.mode == 'destroy' && steps.d2.outcome == 'failure'
+        shell: bash
+        run: sleep 120
+
+      - name: Credenciales · intento 3
+        if: inputs.mode == 'destroy' && steps.d2.outcome == 'failure'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.apply-role-arn }}
+          role-session-name: nanoflow-destroy-${{ github.run_id }}-3
+          aws-region: ${{ steps.env.outputs.region }}
+
+      - name: Destroy · intento 3
+        id: d3
+        if: inputs.mode == 'destroy' && steps.d2.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 55
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: destroy
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform plan -destroy -input=false -lock-timeout=5m -no-color -out=destroy.tfplan && terraform apply -input=false -lock-timeout=5m -no-color destroy.tfplan
+
+      - name: Credenciales para la limpieza
+        if: always() && inputs.mode == 'destroy' && steps.pre.outcome == 'success'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.env.outputs.apply-role-arn }}
+          role-session-name: nanoflow-destroy-${{ github.run_id }}-cleanup
+          aws-region: ${{ steps.env.outputs.region }}
+
+      - name: Recursos restantes
+        id: remaining
+        if: always() && inputs.mode == 'destroy' && steps.pre.outcome == 'success'
+        timeout-minutes: 5
+        working-directory: ${{ steps.env.outputs.dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+          if terraform state list -no-color > "$NF_WORK/remaining.txt" 2>"$NF_WORK/remaining.err" </dev/null; then
+            # Solo recursos gestionados (sin data sources).
+            n=$(grep -cvE '(^|\.)data\.|^\s*$' "$NF_WORK/remaining.txt" || true)
+            echo "count=${n}" >> "$GITHUB_OUTPUT"
+            echo "Quedan ${n} recursos en el estado."
+          else
+            echo "::warning::No se pudo leer el estado después del destroy: $(tail -n 1 "$NF_WORK/remaining.err")"
+            echo "count=" >> "$GITHUB_OUTPUT"
+            rm -f "$NF_WORK/remaining.txt"
+          fi
+
+      # Solo lo que ya salió del estado: un destroy a medias deja intacto lo que
+      # sigue gestionado (secretos, log groups, snapshots).
+      - name: Limpiar lo que quedó fuera del estado
+        id: cleanup
+        if: always() && inputs.mode == 'destroy' && steps.remaining.outputs.count != ''
+        continue-on-error: true
+        timeout-minutes: 30
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-destroy@v2
+        with:
+          command: cleanup
+          working-directory: ${{ steps.env.outputs.dir }}
+          state-json: ${{ env.NF_WORK }}/pre-state.json
+          remaining: ${{ env.NF_WORK }}/remaining.txt
+          keep-snapshots: ${{ inputs.keep-snapshots }}
+          out: ${{ env.NF_WORK }}/cleanup.json
+
+      - name: Veredicto
+        id: verdict
+        if: always() && inputs.mode == 'destroy' && steps.authorize.outcome == 'success'
+        shell: bash
+        env:
+          PRE: ${{ steps.pre.outcome }}
+          PREPARE: ${{ steps.prepare.outcome }}
+          D1: ${{ steps.d1.outcome }}
+          D2: ${{ steps.d2.outcome }}
+          D3: ${{ steps.d3.outcome }}
+          REMAINING: ${{ steps.remaining.outputs.count }}
+        run: |
+          attempts=0
+          for o in "$D1" "$D2" "$D3"; do
+            case "$o" in success|failure|cancelled) attempts=$((attempts + 1)) ;; esac
+          done
+          destroyed=false
+          for o in "$D1" "$D2" "$D3"; do [ "$o" = success ] && destroyed=true; done
+          status=failed code='' message=''
+          if [ "$PRE" != success ]; then
+            code=STATE_UNREADABLE message='No se pudo leer el estado de Terraform antes de destruir.'
+          elif [ "$PREPARE" != success ]; then
+            code=PREPARE_FAILED message='No se pudieron quitar las protecciones o vaciar los recursos (o crear los snapshots pedidos): no se destruyó nada con Terraform. Revisa el log del run.'
+          elif [ "$destroyed" != true ]; then
+            code=TERRAFORM_DESTROY_FAILED message="terraform destroy falló en ${attempts} intentos${REMAINING:+: quedan ${REMAINING} recursos en el estado}. Revisa el log del run."
+          elif [ -z "$REMAINING" ]; then
+            code=STATE_UNREADABLE message='El destroy terminó, pero no se pudo leer el estado para confirmar que no queda nada.'
+          elif [ "$REMAINING" != 0 ]; then
+            code=RESOURCES_REMAIN message="Quedan ${REMAINING} recursos en el estado después del destroy."
+          else
+            status=succeeded
+          fi
+          {
+            echo "status=${status}"
+            echo "attempts=${attempts}"
+            echo "code=${code}"
+            echo "message=${message}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Veredicto: ${status}${code:+ (${code})}"
+
+      - name: Resultado
+        id: result
+        if: always() && inputs.mode == 'destroy' && steps.remaining.outputs.count != ''
+        continue-on-error: true
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-destroy@v2
+        with:
+          command: result
+          working-directory: ${{ steps.env.outputs.dir }}
+          state-json: ${{ env.NF_WORK }}/pre-state.json
+          remaining: ${{ env.NF_WORK }}/remaining.txt
+          prepare-json: ${{ env.NF_WORK }}/prepare.json
+          cleanup-json: ${{ env.NF_WORK }}/cleanup.json
+          attempts: ${{ steps.verdict.outputs.attempts }}
+          out: ${{ env.NF_WORK }}/result.json
+
+      - name: Informar la destrucción
+        if: always() && inputs.mode == 'destroy' && steps.authorize.outcome == 'success'
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-destroy@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          destroy-id: ${{ inputs.destroy-id }}
+          phase: destroy
+          mode: destroy
+          environment: ${{ inputs.environment }}
+          keep-snapshots: ${{ inputs.keep-snapshots }}
+          status: ${{ steps.verdict.outputs.status || 'failed' }}
+          result-file: ${{ steps.result.outcome == 'success' && format('{0}/result.json', env.NF_WORK) || '' }}
+          error-code: ${{ steps.verdict.outputs.code }}
+          error-message: ${{ steps.verdict.outputs.message }}
+
+      # Los intentos no cortan el job (para que la limpieza y el reporte corran);
+      # aquí se decide el resultado.
+      - name: Resultado del destroy
+        if: always() && inputs.mode == 'destroy' && steps.authorize.outcome == 'success'
+        shell: bash
+        env:
+          NF_STATUS: ${{ steps.verdict.outputs.status }}
+          NF_MESSAGE: ${{ steps.verdict.outputs.message }}
+        run: |
+          if [ "$NF_STATUS" != "succeeded" ]; then
+            echo "::error::${NF_MESSAGE:-La destrucción no terminó.}"
+            exit 1
+          fi
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        env:
+          NF_ENV: ${{ inputs.environment }}
+          NF_MODE: ${{ inputs.mode }}
+          NF_PLAN: ${{ steps.plan.outcome }}
+          NF_STATUS: ${{ steps.verdict.outputs.status }}
+          NF_ATTEMPTS: ${{ steps.verdict.outputs.attempts }}
+          NF_REMAINING: ${{ steps.remaining.outputs.count }}
+          NF_KEEP: ${{ inputs.keep-snapshots }}
+        run: |
+          {
+            echo "## Terraform destroy · ${NF_ENV} · ${NF_MODE}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            if [ "$NF_MODE" = plan ]; then
+              echo "| Plan | ${NF_PLAN:-sin correr} |"
+              if [ -f "$NF_WORK/plan-report.json" ]; then
+                echo "| A destruir | $(jq -r '.summary.delete' "$NF_WORK/plan-report.json") recursos |"
+              fi
+            else
+              echo "| Resultado | ${NF_STATUS:-sin correr} |"
+              echo "| Intentos | ${NF_ATTEMPTS:-0} |"
+              echo "| Restantes | ${NF_REMAINING:-?} |"
+              echo "| Conservar snapshots | ${NF_KEEP} |"
+            fi
+            echo "| Rama | ${GITHUB_REF_NAME} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+          } >> "$GITHUB_STEP_SUMMARY"

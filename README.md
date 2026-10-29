@@ -297,6 +297,7 @@ credenciales: cada cuenta de ambiente confía directamente en el OIDC de GitHub
 | `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan; reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
 | `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado y `apply` de ese plan; despliegue informado con `report-deployment`; si el apply sale bien, el output `nanoflow_contract` va a NanoFlow con `report-outputs` (`POST /v1/ci/infra-outputs`), que lo escribe como variables `NF_*` en los repos de aplicación. |
 | `terraform-drift.yml` | `workflow_dispatch` del `drift.yml` del repo, que despacha NanoFlow (nunca `schedule`) en la rama del ambiente | `plan`, dentro del GitHub Environment del ambiente | init y `plan -detailed-exitcode`; reporte a NanoFlow (`report-plan` con `has-changes`). Encontrar drift no falla el job; un plan que falla, sí. Sin fmt, tflint, trivy ni comentario. |
+| `terraform-destroy.yml` | `workflow_dispatch` del `destroy.yml` que pone NanoFlow, en la rama del ambiente | `plan` (modo `plan`) o `apply` (modo `destroy`), dentro del GitHub Environment | Destruye la infraestructura de un ambiente, en dos tiempos; ver [Destruir un ambiente](#destruir-un-ambiente-terraform-destroyyml). |
 
 El ambiente de cada rama, su directorio, su cuenta y sus roles están en
 `.nanoflow/infra.json`, que también genera NanoFlow (acción `infra-env`). El
@@ -337,7 +338,81 @@ jobs:
   Con la tubería, un proceso hijo de Terraform que quedara vivo con la salida
   heredada impedía que el paso terminara aunque Terraform ya hubiera acabado.
 
-Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js`.
+Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js`.
+
+
+## Destruir un ambiente (`terraform-destroy.yml`)
+
+Doc 29 de la consola. El botón «Destruir» de Infraestructura borra **todo** lo
+que NanoFlow creó en un ambiente: los recursos de Terraform, lo que esos
+recursos dejan fuera del estado y, después (lo hace NanoFlow, no este
+workflow), el stack de bootstrap y el bucket de estado. NanoFlow pone en el repo
+un `destroy.yml` (un commit de la App con `[skip ci]` en la rama por defecto y en
+la del ambiente: `workflow_dispatch` exige el archivo en la rama por defecto) que
+solo llama a este workflow:
+
+| Input | |
+|---|---|
+| `api-url`, `audience` | Como en los demás. |
+| `environment` | Ambiente a destruir; debe ser el de la rama despachada (si no, el job falla antes de nada). |
+| `mode` | `plan` o `destroy`. |
+| `destroy-id` | Id de la destrucción en NanoFlow. |
+| `keep-snapshots` | Conservar un snapshot de cada base (`false` por defecto; la consola lo marca en producción). |
+
+**Autorización.** El primer paso, antes de pedir credenciales de AWS, es
+`report-destroy` en fase `start` (`POST /v1/ci/infra-destroys`): NanoFlow
+responde 200 con `authorized: true` solo si hay una destrucción en el estado de
+ese modo (plan pedido o destrucción confirmada) para este repo, rama, ambiente,
+id y `keep-snapshots`, y fija el run. Un `workflow_dispatch` lanzado a mano
+desde GitHub no destruye nada.
+
+**`mode: plan`** (rol de plan, solo lectura): `terraform plan -destroy` y
+`destroy.js inventory`, que cuenta lo que tiene datos (bases y sus snapshots
+manuales, objetos de los buckets, ítems de DynamoDB, usuarios de Cognito,
+connections de Auth0, registros DNS que no son de Terraform, secretos,
+distribuciones, llaves KMS, log groups implícitos y las bases de Supabase, que
+no se tocan). A NanoFlow va `{summary, inventory}` (fase `plan`); los JSON del
+plan y del estado, que traen valores sensibles, se quedan en el runner. Su grupo
+de concurrencia es propio: un apply que llega después no lo cancela.
+
+**`mode: destroy`** (rol de apply, mismo grupo de concurrencia que el apply):
+
+1. `destroy.js prepare` sobre el estado: vacía los buckets (versiones y marcas),
+   quita la protección de borrado de RDS, Aurora, DynamoDB y Cognito, y borra las
+   bases con la CLI (`--skip-final-snapshot --delete-automated-backups`): el
+   snapshot final de las plantillas tiene un nombre fijo y en producción depende
+   del ambiente. Con `keep-snapshots`, antes crea `<base>-nanoflow-<yyyymmddhhmm>`
+   (RDS/Aurora) o un backup bajo demanda (DynamoDB), conserva los snapshots de
+   pre-migración y saca del estado la llave KMS que los cifra (si Terraform la
+   programara para borrarse, quedarían inservibles; el alias sí se borra). Borra
+   también los registros de la zona que no son de Terraform (no el SOA ni el NS
+   del apex). Si algo de esto falla, no se corre Terraform.
+2. Hasta 3 intentos de `plan -destroy` + `apply`, cada uno con credenciales
+   nuevas (la sesión del rol dura 1 h) y 2 min de espera entre intentos (ENIs de
+   las Lambdas en VPC, origen VPC de CloudFront). Cada intento, 55 min como máximo.
+3. `destroy.js cleanup`, solo sobre lo que ya salió del estado: borra sin
+   recuperación los secretos (libera los nombres para recrear), los log groups
+   que AWS crea solo (`/aws/rds/instance|cluster/<id>/postgresql`,
+   `/aws/rds/proxy/<nombre>`, Container Insights del clúster ECS) y, sin
+   `keep-snapshots`, los snapshots de pre-migración (`<base>-pre-*`).
+4. `terraform state list` → restantes; `report-destroy` en fase `destroy` con
+   `status`, el resultado (`remaining`, `destroyed`, `attempts`, `snapshots`,
+   `retained`, `cleaned`, `warnings`) y, si falló, `error.code`
+   (`STATE_UNREADABLE`, `PREPARE_FAILED`, `TERRAFORM_DESTROY_FAILED`,
+   `RESOURCES_REMAIN`). El job termina en rojo si queda algo.
+
+**La guarda.** Al confirmar, NanoFlow crea la variable de repo
+`NF_INFRA_DESTROYED_<AMBIENTE>` (`DEVELOPMENT`, `STAGING`, `PRODUCTION`; el
+valor es el id de la destrucción). Mientras exista, `terraform-apply.yml` no
+aplica ese ambiente (el job `apply` no corre y, si la variable apareció mientras
+esperaba la concurrencia, su primer paso falla), y `terraform-plan.yml` y
+`terraform-drift.yml` lo saltan con un aviso (acción `infra-destroyed`). NanoFlow
+la borra al volver a construir la infraestructura.
+
+**Lo que este workflow no borra:** snapshots y backups pedidos, sus llaves KMS,
+snapshots manuales hechos a mano (sin `keep-snapshots` quedan sin llave: se
+avisa), los datos de Supabase, el bootstrap y el bucket de estado (los borra
+NanoFlow después), la cuenta AWS y el clúster de ejecución.
 
 ## Versionado
 
