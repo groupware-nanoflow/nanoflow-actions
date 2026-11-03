@@ -40,8 +40,11 @@ function hasChanges(s) {
   return KINDS.some((k) => s[k] > 0);
 }
 
-/** Markdown del comentario del PR. `marker` permite actualizarlo en lugar de duplicarlo. */
-function markdown(s, { env, marker, status = 'succeeded', findings = null, runUrl = '' }) {
+/**
+ * Markdown del comentario del PR. `marker` permite actualizarlo en lugar de duplicarlo.
+ * `extra` es markdown que se agrega tal cual (los `moved` de reconcile-moves, doc 32 §8.1).
+ */
+function markdown(s, { env, marker, status = 'succeeded', findings = null, runUrl = '', extra = '' }) {
   const lines = [marker, `### Terraform plan · ${env}`, ''];
   if (status !== 'succeeded') {
     lines.push('❌ El plan falló. Revisa el log del job.');
@@ -60,6 +63,7 @@ function markdown(s, { env, marker, status = 'succeeded', findings = null, runUr
   if (findings && (findings.high || findings.critical)) {
     lines.push('', `🛡️ ${findings.tool}: **${findings.critical || 0}** críticos y **${findings.high || 0}** altos. El check falla hasta resolverlos o justificarlos.`);
   }
+  if (extra && extra.trim()) lines.push('', extra.trim());
   if (runUrl) lines.push('', `[Log del job](${runUrl})`);
   lines.push('', '<sub>Generado por NanoFlow.</sub>');
   return lines.join('\n') + '\n';
@@ -111,6 +115,7 @@ function main(argv) {
       status: args.status || 'succeeded',
       findings,
       runUrl: args['run-url'] || '',
+      extra: args.extra && fs.existsSync(args.extra) ? fs.readFileSync(args.extra, 'utf8') : '',
     }));
   }
   process.stdout.write(`create=${s.create} update=${s.update} replace=${s.replace} delete=${s.delete}\n`);

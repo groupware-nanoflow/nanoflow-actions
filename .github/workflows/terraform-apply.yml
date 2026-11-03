@@ -11,6 +11,11 @@
 # Un ambiente que NanoFlow destruyó (variable de repo NF_INFRA_DESTROYED_<AMBIENTE>,
 # doc 29) no se aplica: el push no lo recrea hasta que se vuelve a construir la
 # infraestructura desde NanoFlow.
+#
+# Antes de aplicar, reconcile-moves empareja como `moved` (sin versionar) cada
+# recurso que se destruye con el que se crea del mismo tipo y nombre físico, y
+# se planea de nuevo: en paralelo, AWS rechazaría la creación («already
+# exists»). Si quedan grupos que no son 1:1, no se aplica nada (consola, doc 32 §8.1).
 name: NanoFlow terraform apply
 
 on:
@@ -142,12 +147,43 @@ jobs:
           command: terraform init -input=false -lock-timeout=5m
 
       - name: Plan
+        id: plan
         timeout-minutes: 20
         uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
         with:
           step: plan
           working-directory: ${{ needs.resolve.outputs.dir }}
-          command: terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan
+          command: terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+
+      - name: Emparejar direcciones
+        id: reconcile
+        uses: groupware-nanoflow/nanoflow-actions/actions/reconcile-moves@v2
+        with:
+          plan-json: ${{ runner.temp }}/plan.json
+          working-directory: ${{ needs.resolve.outputs.dir }}
+
+      # Se aplica este plan, con los `moved`, y no el primero.
+      - name: Plan con los moved
+        id: replan
+        if: steps.reconcile.outputs.moved != '' && steps.reconcile.outputs.moved != '0'
+        timeout-minutes: 20
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: plan
+          working-directory: ${{ needs.resolve.outputs.dir }}
+          command: terraform plan -input=false -lock-timeout=5m -no-color -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+
+      # Con nombres físicos sin emparejar, el apply chocaría en AWS a medias:
+      # el job falla aquí, antes de tocar nada (Apply queda sin correr).
+      - name: Nombres físicos sin emparejar
+        id: collisions
+        if: steps.reconcile.outputs.collisions != '' && steps.reconcile.outputs.collisions != '0'
+        shell: bash
+        env:
+          NF_MSG: ${{ steps.reconcile.outputs.message }}
+        run: |
+          echo "::error::${NF_MSG}"
+          exit 1
 
       - name: Apply
         id: apply
@@ -189,7 +225,7 @@ jobs:
           audience: ${{ inputs.audience }}
           status: ${{ job.status == 'success' && 'success' || (job.status == 'cancelled' && 'cancelled' || 'failure') }}
           environment-url: ${{ steps.url.outputs.url }}
-          error: ${{ steps.apply.outcome == 'failure' && 'terraform apply falló' || '' }}
+          error: ${{ steps.collisions.outcome == 'failure' && 'el plan destruye y vuelve a crear recursos con el mismo nombre físico sin emparejar (no se aplicó nada)' || (steps.apply.outcome == 'failure' && 'terraform apply falló' || '') }}
 
       - name: Resumen
         if: always()
@@ -198,6 +234,7 @@ jobs:
           NF_ENV: ${{ needs.resolve.outputs.environment }}
           NF_URL: ${{ steps.url.outputs.url }}
           NF_OUTCOME: ${{ steps.apply.outcome }}
+          NF_MOVED_MD: ${{ steps.reconcile.outputs.summary-file }}
         run: |
           {
             echo "## Terraform apply · ${NF_ENV}"
@@ -208,4 +245,8 @@ jobs:
             echo "| Rama | ${GITHUB_REF_NAME} |"
             echo "| Commit | ${GITHUB_SHA} |"
             [ -n "$NF_URL" ] && echo "| URL | ${NF_URL} |"
+            if [ -n "$NF_MOVED_MD" ] && [ -s "$NF_MOVED_MD" ]; then
+              echo ""
+              cat "$NF_MOVED_MD"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

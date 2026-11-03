@@ -294,8 +294,8 @@ credenciales: cada cuenta de ambiente confía directamente en el OIDC de GitHub
 
 | Workflow | Disparador | Rol | Qué hace |
 |---|---|---|---|
-| `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan; reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
-| `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado y `apply` de ese plan; despliegue informado con `report-deployment`; si el apply sale bien, el output `nanoflow_contract` va a NanoFlow con `report-outputs` (`POST /v1/ci/infra-outputs`), que lo escribe como variables `NF_*` en los repos de aplicación. |
+| `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan (con los `moved` de `reconcile-moves`, ver abajo); reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
+| `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado (con los `moved` de `reconcile-moves`; con colisiones no se aplica) y `apply` de ese plan; despliegue informado con `report-deployment`; si el apply sale bien, el output `nanoflow_contract` va a NanoFlow con `report-outputs` (`POST /v1/ci/infra-outputs`), que lo escribe como variables `NF_*` en los repos de aplicación. |
 | `terraform-drift.yml` | `workflow_dispatch` del `drift.yml` del repo, que despacha NanoFlow (nunca `schedule`) en la rama del ambiente | `plan`, dentro del GitHub Environment del ambiente | init y `plan -detailed-exitcode`; reporte a NanoFlow (`report-plan` con `has-changes`). Encontrar drift no falla el job; un plan que falla, sí. Sin fmt, tflint, trivy ni comentario. |
 | `terraform-destroy.yml` | `workflow_dispatch` del `destroy.yml` que pone NanoFlow, en la rama del ambiente | `plan` (modo `plan`) o `apply` (modo `destroy`), dentro del GitHub Environment | Destruye la infraestructura de un ambiente, en dos tiempos; ver [Destruir un ambiente](#destruir-un-ambiente-terraform-destroyyml). |
 
@@ -338,7 +338,24 @@ jobs:
   Con la tubería, un proceso hijo de Terraform que quedara vivo con la salida
   heredada impedía que el paso terminara aunque Terraform ya hubiera acabado.
 
-Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js`.
+- **Recursos que cambian de dirección con el mismo nombre físico** (acción
+  `reconcile-moves`, consola doc 32 §8.1). Si un módulo se renombra, o NanoFlow
+  reemplaza Terraform escrito a mano por el generado, el plan destruye la
+  dirección vieja y crea la nueva con el mismo nombre (`erp-…-dev-employees`), y
+  Terraform lo hace en paralelo: AWS rechaza la creación («EntityAlreadyExists»,
+  «ResourceAlreadyExistsException»). Tras el plan, `reconcile-moves` empareja
+  cada destrucción con la creación del mismo tipo e identidad física (por
+  ejemplo `role`+`policy_arn` de un attachment, `function_name` de una Lambda,
+  `name` del resto), escribe los pares 1:1 como bloques `moved` en
+  `nanoflow_moved.tf` (sin versionar) y se planea de nuevo. El plan y el
+  comentario del PR los listan («🔀 NanoFlow movió…»). Los grupos que no son
+  1:1 son colisiones: el check del plan falla y el apply no corre (el job sale
+  antes de tocar AWS con «El plan destruye y vuelve a crear recursos con el
+  mismo nombre físico…», que el clasificador de NanoFlow reconoce como
+  `TF_NAME_COLLISION`). Tras un apply, el estado ya tiene las direcciones
+  nuevas y el archivo deja de generarse.
+
+Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js actions/reconcile-moves/reconcile.test.js`.
 
 
 ## Destruir un ambiente (`terraform-destroy.yml`)

@@ -93,3 +93,17 @@ test('la CLI escribe resumen, hallazgos y comentario', () => {
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'f.json'), 'utf8')).high, 0);
   assert.match(fs.readFileSync(path.join(dir, 'c.md'), 'utf8'), /<!-- nanoflow:terraform-plan:development -->/);
 });
+
+test('el markdown extra (los moved de reconcile-moves) va antes del log y no toca el resumen', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nf-plan-'));
+  const plan = path.join(dir, 'plan.json');
+  const extra = path.join(dir, 'moved.md');
+  fs.writeFileSync(plan, JSON.stringify({ resource_changes: [rc('aws_iam_role', ['update'])] }));
+  fs.writeFileSync(extra, '#### 🔀 NanoFlow movió 1 recurso de dirección (mismo nombre físico)\n');
+  execFileSync(process.execPath, [path.join(__dirname, 'summarize.js'), plan, '--env', 'development', '--run-url', 'https://x/run',
+    '--extra', extra, '--summary', path.join(dir, 's.json'), '--markdown', path.join(dir, 'c.md')], { encoding: 'utf8' });
+  const md = fs.readFileSync(path.join(dir, 'c.md'), 'utf8');
+  assert.match(md, /🔀 NanoFlow movió 1 recurso[\s\S]*\[Log del job\]/);
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(dir, 's.json'), 'utf8'))).sort(), ['by_type', 'create', 'delete', 'replace', 'update']);
+  assert.doesNotMatch(markdown(summarize(null), { env: 'd', marker: 'm', extra: '  \n' }), /\n\n\n/);
+});

@@ -34,6 +34,12 @@ inputs:
     description: Commit planeado. En un PR, la cabeza del PR (GITHUB_SHA es el merge de prueba).
     required: false
     default: ''
+  extra-markdown:
+    description: >
+      Archivo con markdown que se agrega al comentario del PR y al resumen (p. ej. los
+      recursos que reconcile-moves movió de dirección). No cambia lo que se informa a NanoFlow.
+    required: false
+    default: ''
   has-changes:
     description: >
       Veredicto de `terraform plan -detailed-exitcode` en un drift: 'true' (salió
@@ -62,6 +68,7 @@ runs:
         NF_TRIVY: ${{ inputs.trivy-json }}
         NF_ENV: ${{ inputs.environment }}
         NF_STATUS: ${{ inputs.status }}
+        NF_EXTRA: ${{ inputs.extra-markdown }}
         NF_SCRIPT: ${{ github.action_path }}/summarize.js
         NF_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
@@ -72,6 +79,9 @@ runs:
               --summary "$dir/summary.json" --markdown "$dir/comment.md")
         if [ -n "$NF_TRIVY" ] && [ -f "$NF_TRIVY" ]; then
           args+=(--trivy "$NF_TRIVY" --findings "$dir/findings.json")
+        fi
+        if [ -n "$NF_EXTRA" ] && [ -s "$NF_EXTRA" ]; then
+          args+=(--extra "$NF_EXTRA")
         fi
         counts=$(node "$NF_SCRIPT" "${args[@]}")
         echo "$counts"

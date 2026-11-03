@@ -8,6 +8,12 @@
 # comentario. El check falla si fmt, validate, tflint, trivy (HIGH/CRITICAL) o
 # el plan fallan. Un ambiente que NanoFlow destruyó (NF_INFRA_DESTROYED_<AMBIENTE>,
 # doc 29) no se planea: el check pasa con un aviso hasta que se reconstruye.
+#
+# Un recurso que se destruye y otro que se crea con el mismo tipo y nombre
+# físico (un módulo renombrado, Terraform escrito a mano que NanoFlow
+# reemplazó) chocarían en AWS en paralelo («already exists»): reconcile-moves
+# los empareja como `moved` sin versionar y se planea de nuevo; los que no son
+# 1:1 hacen fallar el check (consola, doc 32 §8.1).
 name: NanoFlow terraform plan
 
 on:
@@ -171,6 +177,25 @@ jobs:
           working-directory: ${{ steps.env.outputs.dir }}
           command: terraform plan -input=false -lock-timeout=5m -no-color ${{ steps.creds.outputs.plan-args }} -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
 
+      - name: Emparejar direcciones
+        id: reconcile
+        if: steps.plan.outcome == 'success'
+        uses: groupware-nanoflow/nanoflow-actions/actions/reconcile-moves@v2
+        with:
+          plan-json: ${{ runner.temp }}/plan.json
+          working-directory: ${{ steps.env.outputs.dir }}
+
+      # Con los `moved` escritos, el plan que se informa y se comenta es este.
+      - name: Plan con los moved
+        id: replan
+        if: steps.reconcile.outputs.moved != '' && steps.reconcile.outputs.moved != '0'
+        timeout-minutes: 20
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: plan
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform plan -input=false -lock-timeout=5m -no-color ${{ steps.creds.outputs.plan-args }} -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+
       - name: Informar el plan
         id: report
         if: always() && steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
@@ -179,9 +204,10 @@ jobs:
           api-url: ${{ inputs.api-url }}
           audience: ${{ inputs.audience }}
           environment: ${{ steps.env.outputs.environment }}
-          status: ${{ steps.plan.outcome == 'success' && 'succeeded' || 'failed' }}
-          plan-json: ${{ steps.plan.outcome == 'success' && format('{0}/plan.json', runner.temp) || '' }}
+          status: ${{ (steps.plan.outcome == 'success' && steps.reconcile.outcome == 'success' && steps.replan.outcome != 'failure') && 'succeeded' || 'failed' }}
+          plan-json: ${{ (steps.plan.outcome == 'success' && steps.reconcile.outcome == 'success' && steps.replan.outcome != 'failure') && format('{0}/plan.json', runner.temp) || '' }}
           trivy-json: ${{ runner.temp }}/trivy.json
+          extra-markdown: ${{ steps.reconcile.outputs.summary-file }}
           pr-number: ${{ github.event.pull_request.number }}
           head-sha: ${{ github.event.pull_request.head.sha }}
 
@@ -211,15 +237,23 @@ jobs:
         shell: bash
         run: cat "${{ steps.report.outputs.comment-file }}" >> "$GITHUB_STEP_SUMMARY"
 
-      # trivy no corta el job para que el plan y el reporte existan igual; aquí
-      # se decide el check.
+      # trivy y las colisiones de nombre no cortan el job para que el plan y el
+      # reporte existan igual; aquí se decide el check.
       - name: Resultado
         if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         shell: bash
         env:
           TRIVY: ${{ steps.trivy.outcome }}
+          NF_COLLISIONS: ${{ steps.reconcile.outputs.collisions }}
+          NF_COLLISION_MSG: ${{ steps.reconcile.outputs.message }}
         run: |
+          fail=0
+          if [ -n "$NF_COLLISIONS" ] && [ "$NF_COLLISIONS" != "0" ]; then
+            echo "::error::${NF_COLLISION_MSG}"
+            fail=1
+          fi
           if [ "$TRIVY" != "success" ]; then
             echo "::error::trivy encontró hallazgos HIGH o CRITICAL (o no pudo correr). Corrígelos o justifícalos con '# trivy:ignore:<id>' junto al recurso."
-            exit 1
+            fail=1
           fi
+          exit "$fail"
