@@ -326,8 +326,17 @@ jobs:
   - **Supabase**, por cada `var.supabase["<base>"]`: proyecto en la variable de
     repo `NF_SUPABASE_<AMBIENTE>_<BASE>` (`TF_VAR_supabase`) y contraseña en el
     secreto `SUPABASE_DB_PASSWORD_<BASE>` del environment (variable efímera
-    `TF_VAR_supabase_passwords`, solo en apply y drift: apply y drift le pasan
-    `toJSON(secrets)` y la acción toma solo esos nombres).
+    `TF_VAR_supabase_passwords`, solo en apply, drift y destroy: la acción
+    recibe los secretos en JSON y toma solo esos nombres).
+  - **Cómo llegan los secretos del environment.** Un workflow reutilizable solo
+    ve los secretos que el llamador le pasa, y `secrets: inherit` no cruza
+    organizaciones (el repo de infra vive en la del cliente). Por eso
+    `apply.yml`, `drift.yml` y `destroy.yml` del repo pasan
+    `secrets: { NF_SECRETS: ${{ toJSON(secrets) }} }`: GitHub evalúa la
+    expresión en el job que declara el environment, así que lleva sus secretos.
+    Un repo generado antes de templates 0.20.1 no lo pasa y sus jobs no reciben
+    ningún secreto del ambiente (suficiente para Keycloak y Cognito; Auth0 y
+    Supabase necesitan reconstruir la infraestructura).
 - `report-plan` y `report-outputs` nunca fallan el job: si NanoFlow no responde, dejan un aviso. Un repo sin el output `nanoflow_contract` (templates < 0.6.0) se salta sin aviso de error.
 - `report-plan` acepta `has-changes` (`true`/`false`, el veredicto de
   `-detailed-exitcode`) y lo envía como `hasChanges`. NanoFlow solo lo usa si
