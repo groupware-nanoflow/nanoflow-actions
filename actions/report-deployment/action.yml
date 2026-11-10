@@ -59,6 +59,12 @@ runs:
           esac
 
           local oidc body code payload
+          # El motivo de un fallo: terraform-run y provider-credentials lo dejan
+          # en un archivo del job. Va después de lo que diga el workflow.
+          local reason="${RUNNER_TEMP:-/tmp}/nf-error.txt"
+          if [ "$NF_STATUS" = "failure" ] && [ -s "$reason" ]; then
+            NF_ERROR="${NF_ERROR:+${NF_ERROR} · }$(head -c 2000 "$reason")"
+          fi
           oidc=$(curl -sS --fail --max-time 10 --retry 2 --retry-connrefused \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value') || true

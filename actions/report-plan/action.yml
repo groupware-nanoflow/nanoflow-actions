@@ -133,8 +133,16 @@ runs:
             [ "$(stat -c %s "$NF_DIR/plan.gz.b64")" -le 4194304 ] && plan_b64="$NF_DIR/plan.gz.b64"
           fi
 
+          # El motivo de un plan que falló (terraform-run y provider-credentials
+          # lo dejan en un archivo del job), para que la consola lo muestre.
+          local reason=''
+          if [ "$NF_STATUS" = "failed" ] && [ -s "${RUNNER_TEMP:-/tmp}/nf-error.txt" ]; then
+            reason=$(head -c 2000 "${RUNNER_TEMP:-/tmp}/nf-error.txt")
+          fi
+
           payload="$NF_DIR/payload.json"
           jq -n \
+            --arg reason "$reason" \
             --arg env "$NF_ENV" --arg status "$NF_STATUS" --arg pr "$NF_PR" \
             --arg changes "$NF_HAS_CHANGES" \
             --arg sha "${NF_HEAD_SHA:-$GITHUB_SHA}" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
@@ -147,6 +155,7 @@ runs:
              + (if $pr != "" then {prNumber: ($pr | tonumber)} else {} end)
              + (if $changes != "" then {hasChanges: ($changes == "true")} else {} end)
              + (if $findings != null then {findings: $findings} else {} end)
+             + (if $reason != "" then {errorMessage: ($reason | .[0:1000])} else {} end)
              + (if $plan != "" then {planGzipBase64: $plan} else {} end)' > "$payload" || {
             echo "no se pudo armar el cuerpo"
             return 1

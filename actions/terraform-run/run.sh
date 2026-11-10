@@ -78,4 +78,10 @@ if [ ! -e "$reader_flag" ]; then
   kill -TERM "$reader" 2>/dev/null
 fi
 wait "$reader" 2>/dev/null
+# Si el comando falló, su motivo queda en un archivo del job: report-plan y
+# report-deployment lo envían a NanoFlow, que lo muestra en la consola.
+if [ "$rc" -ne 0 ]; then
+  excerpt=$("$(dirname "$0")/error-excerpt.sh" "$log" 2>/dev/null || true)
+  [ -n "$excerpt" ] && printf '%s: %s' "$step" "$excerpt" > "$tmp/nf-error.txt"
+fi
 exit "$rc"

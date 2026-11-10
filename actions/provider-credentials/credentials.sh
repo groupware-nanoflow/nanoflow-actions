@@ -2,6 +2,14 @@
 # Ver action.yml. Nunca imprime un secreto: solo nombres y si están.
 set -euo pipefail
 
+# fail deja el motivo en el log y en el archivo del job que report-plan y
+# report-deployment envían a NanoFlow (lo que la consola muestra).
+fail() {
+  echo "::error::$1"
+  printf '%s' "$1" > "${RUNNER_TEMP:-/tmp}/nf-error.txt"
+  exit 1
+}
+
 env_upper=$(printf '%s' "$NF_ENV" | tr '[:lower:]-' '[:upper:]_')
 args=""
 
@@ -12,12 +20,10 @@ auth0() {
   key="NF_AUTH0_DOMAIN_${env_upper}"
   domain=$(jq -r --arg k "$key" '.[$k] // "" | if type == "string" then . else "" end' <<< "${VARS_JSON:-"{}"}")
   if [ -z "$domain" ]; then
-    echo "::error::Faltan las credenciales de Auth0 de ${NF_ENV} (variable ${key}): cárgalas en NanoFlow → Infraestructura → ${NF_ENV} → Identidad."
-    exit 1
+    fail "Faltan las credenciales de Auth0 de ${NF_ENV} (variable ${key}): cárgalas en NanoFlow → Infraestructura → ${NF_ENV} → Identidad."
   fi
   if ! [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-    echo "::error::${key} no es un dominio válido."
-    exit 1
+    fail "${key} no es un dominio válido."
   fi
   {
     echo "AUTH0_DOMAIN=${domain}"
@@ -27,8 +33,7 @@ auth0() {
   valid() { [ "${#1}" -le 512 ] && [[ "$1" =~ ^[A-Za-z0-9._~-]+$ ]]; }
   if [ -n "${NF_AUTH0_ID:-}" ] && [ -n "${NF_AUTH0_SECRET:-}" ]; then
     if ! valid "$NF_AUTH0_ID" || ! valid "$NF_AUTH0_SECRET"; then
-      echo "::error::AUTH0_CLIENT_ID o AUTH0_CLIENT_SECRET de ${NF_ENV} tienen caracteres no válidos: vuelve a cargarlos en NanoFlow."
-      exit 1
+      fail "AUTH0_CLIENT_ID o AUTH0_CLIENT_SECRET de ${NF_ENV} tienen caracteres no válidos: vuelve a cargarlos en NanoFlow."
     fi
     echo "::add-mask::${NF_AUTH0_SECRET}"
     {
@@ -40,8 +45,7 @@ auth0() {
   fi
 
   if [ "$NF_MODE" != "plan" ]; then
-    echo "::error::Faltan los secretos AUTH0_CLIENT_ID y AUTH0_CLIENT_SECRET del environment ${NF_ENV}: cárgalos en NanoFlow → Infraestructura → ${NF_ENV} → Identidad."
-    exit 1
+    fail "Faltan los secretos AUTH0_CLIENT_ID y AUTH0_CLIENT_SECRET del environment ${NF_ENV}: cárgalos en NanoFlow → Infraestructura → ${NF_ENV} → Identidad."
   fi
   # El provider no llama a Auth0 hasta que lo necesita: con -refresh=false el
   # plan compara la configuración con el estado sin pedir un token.
@@ -64,15 +68,13 @@ supabase() {
     key="NF_SUPABASE_${env_upper}_${suffix}"
     conn=$(jq -c --arg k "$key" '.[$k] // "" | if type == "string" then (try fromjson catch null) else null end' <<< "${VARS_JSON:-"{}"}")
     if [ "$conn" = "null" ]; then
-      echo "::error::Falta la conexión a Supabase de la base ${name} en ${NF_ENV} (variable ${key}): cárgala en NanoFlow → Infraestructura → ${NF_ENV} → Datos."
-      exit 1
+      fail "Falta la conexión a Supabase de la base ${name} en ${NF_ENV} (variable ${key}): cárgala en NanoFlow → Infraestructura → ${NF_ENV} → Datos."
     fi
     if ! jq -e '(.host | type == "string" and test("^[a-z0-9.-]+\\.pooler\\.supabase\\.com$")) and
                 (.projectRef | type == "string" and test("^[a-z]{20}$")) and
                 (.database | type == "string" and test("^[A-Za-z0-9_-]{1,63}$")) and
                 (.passwordVersion | type == "number" and . >= 0 and . == floor)' <<< "$conn" >/dev/null; then
-      echo "::error::${key} no tiene la forma {host, projectRef, database, passwordVersion}: vuelve a cargar la conexión en NanoFlow."
-      exit 1
+      fail "${key} no tiene la forma {host, projectRef, database, passwordVersion}: vuelve a cargar la conexión en NanoFlow."
     fi
     projects=$(jq -c --arg n "$name" --argjson c "$conn" '. + {($n): {host: $c.host, projectRef: $c.projectRef, database: $c.database, passwordVersion: $c.passwordVersion}}' <<< "$projects")
 
@@ -82,8 +84,7 @@ supabase() {
       continue
     fi
     if [ "${#pw}" -gt 256 ] || [[ "$pw" == *[[:cntrl:]]* ]]; then
-      echo "::error::SUPABASE_DB_PASSWORD_${suffix} de ${NF_ENV} no es válida: vuelve a cargarla en NanoFlow."
-      exit 1
+      fail "SUPABASE_DB_PASSWORD_${suffix} de ${NF_ENV} no es válida: vuelve a cargarla en NanoFlow."
     fi
     echo "::add-mask::${pw}"
     passwords=$(jq -c --arg n "$name" --arg p "$pw" '. + {($n): $p}' <<< "$passwords")
@@ -94,8 +95,7 @@ supabase() {
   echo "TF_VAR_supabase=${projects}" >> "$GITHUB_ENV"
   if [ -n "$missing" ]; then
     if [ "$NF_MODE" != "plan" ]; then
-      echo "::error::Faltan los secretos${missing} del environment ${NF_ENV}: carga la contraseña en NanoFlow → Infraestructura → ${NF_ENV} → Datos."
-      exit 1
+      fail "Faltan los secretos${missing} del environment ${NF_ENV}: carga la contraseña en NanoFlow → Infraestructura → ${NF_ENV} → Datos."
     fi
     # La contraseña solo va a un atributo de solo escritura: el plan no la necesita.
     echo "::notice::Un PR no ve las contraseñas de Supabase de ${NF_ENV}: el plan no las escribe y el apply las toma del environment."
