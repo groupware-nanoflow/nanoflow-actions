@@ -3,7 +3,8 @@
 # pocas líneas, para que NanoFlow lo muestre sin abrir el log de GitHub.
 #
 # Toma los bloques `Error: …` de la salida (hasta 3 distintos, cada uno con el
-# recurso de su línea `with …`) y cuenta los demás. Si no hay ninguno, las
+# recurso de su línea `with …` y, si es un local-exec, con lo que escribió el
+# comando) y cuenta los demás. Si no hay ninguno, las
 # últimas líneas con texto. Nunca más de 900 caracteres.
 #
 # La salida de Terraform no trae secretos, pero un proveedor puede citar lo que
@@ -24,9 +25,10 @@ text=$(awk '
       line = msg
       if (length(line) > 400) line = substr(line, 1, 400) "…"
       if (with != "") line = line " (" with ")"
+      if (output != "") line = line "\n  " output
       out = out (out == "" ? "" : "\n") line
     }
-    msg = ""; with = ""
+    msg = ""; with = ""; output = ""
   }
   {
     gsub(/\033\[[0-9;]*m/, "")
@@ -37,6 +39,12 @@ text=$(awk '
     with = $0
     sub(/^ +with /, "", with)
     sub(/,$/, "", with)
+  }
+  # Un local-exec que falla: lo que el comando escribió va después de
+  # «exit status N. Output:» (el motivo real; «local-exec provisioner error» no dice nada).
+  msg != "" && output == "" && match($0, /exit status [0-9]+\. Output: /) {
+    output = substr($0, RSTART + RLENGTH)
+    if (length(output) > 300) output = substr(output, 1, 300) "…"
   }
   END {
     flush()
