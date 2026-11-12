@@ -1,0 +1,227 @@
+# Workflow reutilizable de NanoFlow: detección de drift del repo de infra de un
+# proyecto de AZURE (<proyecto>-core-infra) en un ambiente. Es el hermano de
+# terraform-drift.yml (AWS), que no cambia.
+#
+# Lo despacha NanoFlow (workflow_dispatch del drift.yml del repo, nunca
+# `schedule`) en la rama del ambiente. Corre `terraform plan -detailed-exitcode`
+# con la identidad de PLAN de ese ambiente; el job declara `environment: <env>`
+# porque la credencial federada de esa identidad solo acepta `pull_request` o
+# `environment:<env>`. El resultado llega a NanoFlow (report-plan) con
+# `hasChanges`. Encontrar drift NO falla el job: es información que NanoFlow
+# muestra. Solo falla si el plan falla. Sin fmt, tflint, trivy ni comentario de
+# PR. Un ambiente que NanoFlow destruyó (NF_INFRA_DESTROYED_<AMBIENTE>, doc 29)
+# no se revisa: el job pasa con un aviso.
+name: NanoFlow terraform drift (Azure)
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: Base del API de NanoFlow.
+        required: true
+        type: string
+      audience:
+        description: Audiencia OIDC de NanoFlow, p. ej. nanoflow-dev (para el log en vivo y el reporte).
+        required: true
+        type: string
+      environment:
+        description: Ambiente a revisar (development | staging | production). Debe ser el de la rama despachada.
+        required: true
+        type: string
+      config:
+        description: Configuración de ambientes que genera NanoFlow.
+        required: false
+        type: string
+        default: .nanoflow/infra.json
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      live-logs:
+        description: Reenviar a NanoFlow, en vivo, la salida de init y plan.
+        required: false
+        type: boolean
+        default: true
+    # Los secretos del GitHub Environment del ambiente. Un workflow reutilizable
+    # solo ve los secretos que el llamador le pasa (y `secrets: inherit` no cruza
+    # organizaciones), así que el repo de infra los pasa todos en uno:
+    # `NF_SECRETS: ${{ toJSON(secrets) }}`, que GitHub evalúa en el job que
+    # declara el environment. Sin él (repos generados antes) el job no recibe
+    # ningún secreto del ambiente, y eso no alcanza para Supabase.
+    secrets:
+      NF_SECRETS:
+        description: toJSON(secrets) del llamador.
+        required: false
+
+jobs:
+  drift:
+    runs-on: ${{ inputs.runs-on }}
+    # El GitHub Environment del ambiente: hace que el `sub` del token OIDC sea
+    # `…:environment:<env>` (lo que acepta la identidad de plan) y solo admite la
+    # rama del ambiente.
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 45
+    # El que llama concede estos permisos; un workflow reutilizable no puede
+    # pedir más.
+    permissions:
+      contents: read
+      id-token: write
+    # Un drift por ambiente a la vez; uno en curso no se cancela.
+    concurrency:
+      group: nanoflow-terraform-azure-drift-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolver el ambiente
+        id: env
+        uses: groupware-nanoflow/nanoflow-actions/actions/azure-infra-env@v2
+        with:
+          branch: ${{ github.ref_name }}
+          config: ${{ inputs.config }}
+
+      - name: Verificar el ambiente
+        shell: bash
+        env:
+          NF_FOUND: ${{ steps.env.outputs.found }}
+          NF_RESOLVED: ${{ steps.env.outputs.environment }}
+          NF_EXPECTED: ${{ inputs.environment }}
+        run: |
+          if [ "$NF_FOUND" != "true" ]; then
+            echo "::error::La rama ${GITHUB_REF_NAME} no es la de ningún ambiente: el drift se despacha en la rama del ambiente ${NF_EXPECTED}."
+            exit 1
+          fi
+          if [ "$NF_RESOLVED" != "$NF_EXPECTED" ]; then
+            echo "::error::La rama ${GITHUB_REF_NAME} es la del ambiente ${NF_RESOLVED}, no la de ${NF_EXPECTED}."
+            exit 1
+          fi
+
+      - name: Ambiente destruido
+        id: destroyed
+        uses: groupware-nanoflow/nanoflow-actions/actions/infra-destroyed@v2
+        with:
+          environment: ${{ inputs.environment }}
+          vars-json: ${{ toJSON(vars) }}
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.destroyed.outputs.destroyed != 'true'
+        with:
+          terraform_version: ${{ steps.env.outputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Credenciales de plan
+        if: steps.destroyed.outputs.destroyed != 'true'
+        uses: groupware-nanoflow/nanoflow-actions/actions/azure-oidc@v2
+        with:
+          client-id: ${{ steps.env.outputs.plan-client-id }}
+          tenant-id: ${{ steps.env.outputs.tenant-id }}
+          subscription-id: ${{ steps.env.outputs.subscription-id }}
+
+      - name: Preparar el log en vivo
+        if: steps.destroyed.outputs.destroyed != 'true'
+        uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          check-run-id: ${{ job.check_run_id }}
+          enabled: ${{ inputs.live-logs }}
+
+      # Proveedores externos (Auth0): el job corre en el environment y ve sus
+      # secretos, así que el drift sí refresca contra Auth0.
+      - name: Credenciales de proveedores externos
+        if: steps.destroyed.outputs.destroyed != 'true'
+        uses: groupware-nanoflow/nanoflow-actions/actions/provider-credentials@v2
+        with:
+          environment: ${{ steps.env.outputs.environment }}
+          working-directory: ${{ steps.env.outputs.dir }}
+          mode: apply
+          vars-json: ${{ toJSON(vars) }}
+          auth0-client-id: ${{ secrets.NF_SECRETS && fromJSON(secrets.NF_SECRETS).AUTH0_CLIENT_ID || '' }}
+          auth0-client-secret: ${{ secrets.NF_SECRETS && fromJSON(secrets.NF_SECRETS).AUTH0_CLIENT_SECRET || '' }}
+          secrets-json: ${{ secrets.NF_SECRETS || '{}' }}
+
+      - name: Init
+        id: init
+        if: steps.destroyed.outputs.destroyed != 'true'
+        timeout-minutes: 10
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: init
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: terraform init -input=false -lock-timeout=5m
+
+      # -detailed-exitcode: 0 = sin cambios, 1 = error, 2 = hay cambios (drift).
+      # terraform-run termina con el código del comando, así que el 2 se anota
+      # en un archivo y el comando sale con 0: el drift no falla el paso; el 1
+      # sí.
+      - name: Plan
+        id: plan
+        if: steps.init.outcome == 'success'
+        timeout-minutes: 20
+        uses: groupware-nanoflow/nanoflow-actions/actions/terraform-run@v2
+        with:
+          step: plan
+          working-directory: ${{ steps.env.outputs.dir }}
+          command: >-
+            rc=0; terraform plan -detailed-exitcode -input=false -lock-timeout=5m -no-color -out=tfplan || rc=$?;
+            echo "$rc" > "$RUNNER_TEMP/nf-drift-exitcode";
+            [ "$rc" = 0 ] || [ "$rc" = 2 ] || exit "$rc";
+            terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+
+      - name: Resultado del plan
+        id: drift
+        if: always() && steps.plan.outcome != 'skipped'
+        shell: bash
+        env:
+          NF_OUTCOME: ${{ steps.plan.outcome }}
+        run: |
+          rc=$(cat "$RUNNER_TEMP/nf-drift-exitcode" 2>/dev/null || true)
+          changes=''
+          if [ "$NF_OUTCOME" = "success" ]; then
+            case "$rc" in
+              0) changes=false ;;
+              2) changes=true ;;
+            esac
+          fi
+          echo "has-changes=${changes}" >> "$GITHUB_OUTPUT"
+
+      - name: Informar el plan
+        id: report
+        if: always() && steps.env.outputs.found == 'true' && steps.env.outputs.environment == inputs.environment && steps.destroyed.outputs.destroyed != 'true'
+        uses: groupware-nanoflow/nanoflow-actions/actions/report-plan@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          environment: ${{ steps.env.outputs.environment }}
+          status: ${{ steps.plan.outcome == 'success' && 'succeeded' || 'failed' }}
+          plan-json: ${{ steps.plan.outcome == 'success' && format('{0}/plan.json', runner.temp) || '' }}
+          head-sha: ${{ github.sha }}
+          has-changes: ${{ steps.drift.outputs.has-changes }}
+
+      - name: Resumen
+        if: always()
+        shell: bash
+        env:
+          NF_ENV: ${{ inputs.environment }}
+          NF_OUTCOME: ${{ steps.plan.outcome }}
+          NF_CHANGES: ${{ steps.drift.outputs.has-changes }}
+          NF_COMMENT: ${{ steps.report.outputs.comment-file }}
+        run: |
+          case "$NF_CHANGES" in
+            true) verdict="Drift detectado" ;;
+            false) verdict="Sin drift" ;;
+            *) verdict="El plan no terminó (${NF_OUTCOME:-sin correr})" ;;
+          esac
+          {
+            echo "## Terraform drift · ${NF_ENV}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Resultado | ${verdict} |"
+            echo "| Rama | ${GITHUB_REF_NAME} |"
+            echo "| Commit | ${GITHUB_SHA} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$NF_COMMENT" ] && [ -f "$NF_COMMENT" ]; then
+            cat "$NF_COMMENT" >> "$GITHUB_STEP_SUMMARY"
+          fi

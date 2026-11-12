@@ -366,6 +366,25 @@ jobs:
 
 Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js actions/reconcile-moves/reconcile.test.js`.
 
+### Repos de infra de Azure (`terraform-azure-*.yml`)
+
+Un proyecto de Azure (doc 40 de la consola, §18) usa tres workflows hermanos, que son los de arriba con dos piezas distintas. **Los de AWS no cambian**: son archivos aparte.
+
+| Workflow | Hermano de | Identidad |
+|---|---|---|
+| `terraform-azure-plan.yml` | `terraform-plan.yml` | `plan`: lee el grupo de recursos del ambiente y el estado |
+| `terraform-azure-apply.yml` | `terraform-apply.yml` | `apply`, **solo** dentro del GitHub Environment del ambiente |
+| `terraform-azure-drift.yml` | `terraform-drift.yml` | `plan`, dentro del GitHub Environment del ambiente |
+
+- **`azure-infra-env`** lee el `.nanoflow/infra.json` de Azure (`"provider": "azure"`): por ambiente, su suscripción, su directorio de Entra ID, su grupo de recursos y los ids de cliente de las identidades `plan` y `apply`. Valida cada valor antes de dejarlo salir y rechaza un archivo de AWS. Pruebas: `bash actions/azure-infra-env/resolve.test.sh`.
+- **`azure-oidc`** deja las variables `ARM_*` con las que el proveedor `azurerm` y su backend entran a Azure **con el token OIDC del job, sin secretos**. No hay credenciales que guardar ni que entregar: las identidades son administradas, viven en la suscripción del cliente, y su credencial federada decide qué rama o environment puede usarlas (`pull_request` para `plan`; `environment:<ambiente>` para `plan` y `apply`).
+
+Lo que falta respecto a AWS:
+
+- **No hay `terraform-azure-destroy.yml` todavía.** La limpieza de un ambiente de Azure (purgar el Key Vault en borrado suave, entre otras) llega con las funciones de destrucción.
+- **`reconcile-moves` no conoce los tipos de Azure**, así que no empareja nada: un módulo renombrado se planea como destruir y crear.
+- **No se han ejecutado contra Azure.** Son los workflows de AWS con esas dos piezas cambiadas; su primera ejecución real será la prueba.
+
 
 ## Destruir un ambiente (`terraform-destroy.yml`)
 
@@ -449,4 +468,6 @@ workflows de Terraform y las acciones `report-plan`, `report-outputs` e
 `infra-env`. `deploy-aws.yml` agregó el input opcional `environment` y la clave
 `env-map` sin romper a quien no los usa, así que siguió en `@v1`; lo mismo
 la clave `databases` (paso «Migraciones», acción `db-migrate`) y los workflows
-`db-check.yml` y `db-drift.yml`.
+`db-check.yml` y `db-drift.yml`. Los workflows `terraform-azure-*.yml` y las
+acciones `azure-infra-env` y `azure-oidc` son archivos nuevos: mover `@v2` para
+incluirlos no cambia ningún archivo que use un repo de AWS.

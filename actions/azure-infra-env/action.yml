@@ -1,0 +1,57 @@
+name: NanoFlow Azure infra environment
+description: >
+  Lee .nanoflow/infra.json de un repo de infra de Azure (lo genera NanoFlow) y
+  resuelve qué ambiente corresponde a una rama: su directorio, su suscripción,
+  su grupo de recursos y las identidades de plan y apply. Una rama sin ambiente
+  deja found=false; no falla. Un archivo de AWS falla: ese repo usa infra-env.
+
+inputs:
+  branch:
+    description: Rama a resolver (la base del PR en un plan, la del push en un apply).
+    required: true
+  config:
+    description: Ruta del archivo de configuración.
+    required: false
+    default: .nanoflow/infra.json
+
+outputs:
+  found:
+    description: "'true' si la rama es la de un ambiente"
+    value: ${{ steps.resolve.outputs.found }}
+  environment:
+    value: ${{ steps.resolve.outputs.environment }}
+    description: development | staging | production
+  dir:
+    value: ${{ steps.resolve.outputs.dir }}
+    description: Directorio de Terraform del ambiente
+  subscription-id:
+    value: ${{ steps.resolve.outputs.subscription-id }}
+    description: Suscripción de Azure del ambiente
+  tenant-id:
+    value: ${{ steps.resolve.outputs.tenant-id }}
+    description: Directorio de Entra ID de la suscripción
+  resource-group:
+    value: ${{ steps.resolve.outputs.resource-group }}
+    description: Grupo de recursos del proyecto en el ambiente
+  region:
+    value: ${{ steps.resolve.outputs.region }}
+    description: Región
+  plan-client-id:
+    value: ${{ steps.resolve.outputs.plan-client-id }}
+    description: Id de cliente de la identidad de plan (PR y job del environment)
+  apply-client-id:
+    value: ${{ steps.resolve.outputs.apply-client-id }}
+    description: Id de cliente de la identidad de apply (solo el job del environment)
+  terraform-version:
+    value: ${{ steps.resolve.outputs.terraform-version }}
+    description: Versión de Terraform del repo
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        NF_BRANCH: ${{ inputs.branch }}
+        NF_CONFIG: ${{ inputs.config }}
+      run: '"$GITHUB_ACTION_PATH/resolve.sh"'
