@@ -381,7 +381,12 @@ Un proyecto de Azure (doc 40 de la consola, §18) usa tres workflows hermanos, q
 
 Lo que falta respecto a AWS:
 
-- **No hay `terraform-azure-destroy.yml` todavía.** La limpieza de un ambiente de Azure (purgar el Key Vault en borrado suave, entre otras) llega con las funciones de destrucción.
+- **Destruir un ambiente: `terraform-azure-destroy.yml`** (doc 40 de la consola, §21). Mismo contrato que
+  `terraform-destroy.yml` (lo despacha NanoFlow con `mode: plan | destroy`, pide autorización antes de entrar a Azure,
+  hasta tres intentos, informa el plan y el resultado), con la identidad `plan` para el plan y `apply` para el destroy.
+  No tiene preparación ni limpieza con la CLI de la nube: el blueprint de Azure no crea nada protegido contra borrado
+  ni fuera del estado. El inventario y el resultado salen de los JSON de Terraform (`actions/terraform-azure-destroy`,
+  que no llama a Azure) y avisan del borrado suave de Key Vault y API Management. `keep-snapshots` no tiene efecto.
 - **`reconcile-moves` no conoce los tipos de Azure**, así que no empareja nada: un módulo renombrado se planea como destruir y crear.
 - **No se han ejecutado contra Azure.** Son los workflows de AWS con esas dos piezas cambiadas; su primera ejecución real será la prueba.
 
