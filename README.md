@@ -273,6 +273,73 @@ pero un `failure` después de un `success` (o un `in_progress`) se rechaza con u
 aviso. Solo `push`, `workflow_dispatch` y `release` desde una rama con ambiente
 pueden informar un despliegue.
 
+## Desplegar en Microsoft Azure (`deploy-azure.yml`)
+
+Un proyecto cuya arquitectura está en Azure tiene, por ambiente, una
+suscripción en lugar de una cuenta AWS. Sus repositorios de aplicación llaman a
+`deploy-azure.yml` (NanoFlow escribe ese workflow al conectar el repositorio a
+la infraestructura):
+
+```yaml
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/deploy-azure.yml@v2
+    with:
+      api-url: https://devapi-nanoflow.groupware.com.co
+      audience: nanoflow-dev
+      environment: ${{ github.ref_name == 'develop' && 'development' || '' }}
+```
+
+El manifiesto `.nanoflow/deploy.yml` es el mismo (`build`, `deploy`, `env-map`,
+`url`, `mask-env`, por ambiente o en la raíz) y el job informa a NanoFlow lo
+mismo: el log en vivo y el resultado del despliegue. Lo que cambia:
+
+- **NanoFlow no entrega credenciales.** `POST /v1/ci/azure-session` hace las
+  mismas comprobaciones que en AWS (repositorio, rama → ambiente, promoción
+  aprobada, infraestructura no destruida) y responde solo identificadores: el
+  directorio, la suscripción, el grupo de recursos y el id de cliente de la
+  **identidad de despliegue de ese repositorio**, que creó Terraform al aplicar
+  la infraestructura. El job entra a Azure canjeando su propio token OIDC por
+  esa identidad (`az login --federated-token`), que solo confía en ese
+  repositorio dentro del GitHub Environment del ambiente.
+- **`environment` es obligatorio.** La identidad de despliegue confía en
+  `repo:<org>/<repo>:environment:<ambiente>`: sin el GitHub Environment el
+  token del job no coincide y Azure lo rechaza.
+- **La identidad puede poco.** Subir imágenes al registro del ambiente,
+  actualizar los Container Apps de los servicios de ese repositorio y, si
+  publica la SPA, leer del Key Vault el token de despliegue de su Static Web
+  App. Nada más: no crea ni borra recursos.
+- **Todavía no hay paso de migraciones.** La clave `databases` no se ejecuta en
+  este workflow.
+
+Los scripts `build` y `deploy` reciben `AZURE_TENANT_ID`,
+`AZURE_SUBSCRIPTION_ID`, `AZURE_CLIENT_ID`, `AZURE_RESOURCE_GROUP`,
+`AZURE_LOCATION` y `AZURE_REGISTRY`, con la CLI `az` ya dentro de la
+suscripción. El workflow renueva esa sesión justo antes del `deploy`: el token
+de GitHub con el que la CLI pide los suyos dura pocos minutos y un build largo
+lo dejaría vencido.
+
+Para un pipeline propio, la acción suelta:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+environment: development
+steps:
+  - uses: groupware-nanoflow/nanoflow-actions/actions/azure-credentials@v2
+    with:
+      api-url: https://devapi-nanoflow.groupware.com.co
+      audience: nanoflow-dev
+  - run: az containerapp list --resource-group "$AZURE_RESOURCE_GROUP" --output table
+```
+
+Deja además `$RUNNER_TEMP/nf-az-login.sh`, que repite el inicio de sesión
+cuando hace falta.
+
 ## Cosas que conviene saber
 
 - **Una hora.** Las credenciales son temporales y AWS limita a una hora la
@@ -479,4 +546,7 @@ workflows de Terraform y las acciones `report-plan`, `report-outputs` e
 la clave `databases` (paso «Migraciones», acción `db-migrate`) y los workflows
 `db-check.yml` y `db-drift.yml`. Los workflows `terraform-azure-*.yml` y las
 acciones `azure-infra-env` y `azure-oidc` son archivos nuevos: mover `@v2` para
-incluirlos no cambia ningún archivo que use un repo de AWS.
+incluirlos no cambia ningún archivo que use un repo de AWS. Lo mismo
+`deploy-azure.yml` y la acción `azure-credentials`: los repos de aplicación de
+un proyecto en Azure apuntan a `@v2`; los de AWS siguen en `@v1` con
+`deploy-aws.yml`, que no cambió.
