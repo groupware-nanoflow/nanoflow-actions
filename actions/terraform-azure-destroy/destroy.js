@@ -57,6 +57,12 @@ function facts(state) {
     containerApps: names('azurerm_container_app'),
     apiManagement: names('azurerm_api_management'),
     staticSites: names('azurerm_static_web_app'),
+    // Lo que guarda datos del producto: archivos y mensajes en cola.
+    storageAccounts: names('azurerm_storage_account'),
+    blobContainers: names('azurerm_storage_container'),
+    serviceBus: names('azurerm_servicebus_namespace'),
+    queues: names('azurerm_servicebus_queue'),
+    topics: names('azurerm_servicebus_topic'),
   };
 }
 
@@ -95,6 +101,10 @@ function inventory(state, plan) {
   for (const name of f.registries) warnings.push(`Las imágenes del registro de contenedores ${name} se borran con él.`);
   for (const w of f.workspaces) warnings.push(`Los logs del workspace ${w.name} se borran con él.`);
   if (f.secrets > 0) warnings.push(`Los ${f.secrets} secretos del Key Vault se borran con él.`);
+  for (const name of f.blobContainers) warnings.push(`Los archivos del contenedor ${name} se borran con su cuenta de almacenamiento.`);
+  for (const name of f.serviceBus) {
+    warnings.push(`Los mensajes sin procesar de Service Bus ${name} (${f.queues.length} colas, ${f.topics.length} temas) se pierden.`);
+  }
   warnings.push(...softDeleteWarnings(f));
   return {
     summary: summarize(plan),
@@ -112,6 +122,11 @@ function inventory(state, plan) {
         containerApps: f.containerApps,
         apiManagement: f.apiManagement,
         staticSites: f.staticSites,
+        storageAccounts: f.storageAccounts,
+        blobContainers: f.blobContainers,
+        serviceBus: f.serviceBus,
+        queues: f.queues,
+        topics: f.topics,
       },
       survives: supabaseBases(plan),
       warnings,

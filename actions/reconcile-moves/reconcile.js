@@ -24,7 +24,7 @@ const path = require('node:path');
 
 const MOVED_FILE = 'nanoflow_moved.tf';
 
-// La identidad física por tipo: los atributos que AWS usa como nombre único
+// La identidad física por tipo: los atributos que la nube usa como nombre único
 // (con su ámbito cuando el nombre no es global). El orden importa solo para leer.
 const IDENTITY = {
   aws_iam_role_policy_attachment: ['role', 'policy_arn'],
@@ -37,6 +37,27 @@ const IDENTITY = {
   aws_lambda_function: ['function_name'],
   aws_s3_bucket: ['bucket'],
   aws_cloudwatch_metric_alarm: ['alarm_name'],
+
+  // Microsoft Azure (consola, doc 40 §22; atributos de azurerm 4.x). Aquí van
+  // los tipos cuyo nombre solo es único dentro de su padre, o que no tienen
+  // nombre: sin su ámbito, el nombre solo emparejaría recursos de padres
+  // distintos. Los de nombre global (Key Vault, registro, API Management, Static
+  // Web App, cuenta de almacenamiento) se emparejan por `name`, como el resto.
+  azurerm_role_assignment: ['scope', 'role_definition_name', 'principal_id'],
+  azurerm_key_vault_secret: ['key_vault_id', 'name'],
+  azurerm_api_management_api: ['resource_group_name', 'api_management_name', 'name', 'revision'],
+  azurerm_api_management_api_operation: ['resource_group_name', 'api_management_name', 'api_name', 'operation_id'],
+  azurerm_api_management_api_policy: ['resource_group_name', 'api_management_name', 'api_name'],
+  azurerm_container_app: ['resource_group_name', 'name'],
+  azurerm_container_app_environment: ['resource_group_name', 'name'],
+  azurerm_user_assigned_identity: ['resource_group_name', 'name'],
+  azurerm_log_analytics_workspace: ['resource_group_name', 'name'],
+  azurerm_application_insights: ['resource_group_name', 'name'],
+  azurerm_servicebus_queue: ['namespace_id', 'name'],
+  azurerm_servicebus_topic: ['namespace_id', 'name'],
+  azurerm_servicebus_subscription: ['topic_id', 'name'],
+  azurerm_storage_container: ['storage_account_id', 'name'],
+  azurerm_postgresql_flexible_server_database: ['server_id', 'name'],
 };
 
 // El resto: el primero presente de estos. `filename` es de `local_file`, para
@@ -127,6 +148,11 @@ function collisionMessage(collisions) {
 
 const cell = (s) => String(s).replace(/\|/g, '\\|');
 
+/** La nube de los recursos movidos, para el comentario: Azure solo si todos son suyos. */
+function cloudOf(moves) {
+  return moves.length > 0 && moves.every((m) => String(m.type).startsWith('azurerm_')) ? 'Azure' : 'AWS';
+}
+
 /** Markdown para el comentario del PR y el resumen del job ('' si no hay nada). */
 function markdown({ moves, collisions }) {
   const lines = [];
@@ -134,7 +160,7 @@ function markdown({ moves, collisions }) {
     const n = moves.length;
     lines.push(`#### 🔀 NanoFlow movió ${n} ${n === 1 ? 'recurso' : 'recursos'} de dirección (mismo nombre físico)`, '');
     lines.push(
-      'El plan destruía y volvía a crear estos recursos con el mismo nombre; en paralelo, AWS rechaza la creación («already exists»). ' +
+      `El plan destruía y volvía a crear estos recursos con el mismo nombre; en paralelo, ${cloudOf(moves)} rechaza la creación («already exists»). ` +
         'NanoFlow los movió con bloques `moved` que no se versionan (el plan de arriba ya los incluye).',
       '',
     );
@@ -189,4 +215,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { reconcile, identityOf, movedHCL, markdown, collisionMessage, parseArgs, MOVED_FILE, IDENTITY, FALLBACK };
+module.exports = { reconcile, identityOf, movedHCL, markdown, collisionMessage, cloudOf, parseArgs, MOVED_FILE, IDENTITY, FALLBACK };

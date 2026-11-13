@@ -188,3 +188,28 @@ test('main escribe los archivos que lee el workflow', () => {
   assert.ok(!lines.join('\n').includes('secreta'));
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('inventory avisa de los archivos y los mensajes que se pierden (blueprint 0.2.0)', () => {
+  const state = stateFixture();
+  const r = (address, type, values) => ({ address, mode: 'managed', type, name: address.split('.').pop(), values });
+  state.values.root_module.child_modules.push(
+    { address: 'module.blob_files', resources: [
+      r('module.blob_files.azurerm_storage_account.this', 'azurerm_storage_account', { name: 'stshopdevfiles0a1b2c3d', primary_access_key: 'clave-de-la-cuenta' }),
+      r('module.blob_files.azurerm_storage_container.this', 'azurerm_storage_container', { name: 'files' }),
+    ] },
+    { address: 'module.messaging', resources: [
+      r('module.messaging.azurerm_servicebus_namespace.this', 'azurerm_servicebus_namespace', { name: 'sb-shop-dev-1a2b3c', default_primary_connection_string: 'Endpoint=sb://x;SharedAccessKey=secreta-del-bus' }),
+      r('module.messaging.azurerm_servicebus_queue.this["orders"]', 'azurerm_servicebus_queue', { name: 'orders' }),
+      r('module.messaging.azurerm_servicebus_topic.this["events"]', 'azurerm_servicebus_topic', { name: 'events' }),
+    ] },
+  );
+  const { inventory: i } = inventory(state, planFixture());
+  assert.deepEqual(i.azure.blobContainers, ['files']);
+  assert.deepEqual(i.azure.storageAccounts, ['stshopdevfiles0a1b2c3d']);
+  assert.deepEqual(i.azure.serviceBus, ['sb-shop-dev-1a2b3c']);
+  assert.ok(i.warnings.some((w) => w.includes('contenedor files')));
+  assert.ok(i.warnings.some((w) => w.includes('sb-shop-dev-1a2b3c') && w.includes('1 colas, 1 temas')));
+  const text = JSON.stringify(i);
+  assert.ok(!text.includes('clave-de-la-cuenta') && !text.includes('secreta-del-bus'));
+});
+

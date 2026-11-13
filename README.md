@@ -364,7 +364,7 @@ jobs:
   `TF_NAME_COLLISION`). Tras un apply, el estado ya tiene las direcciones
   nuevas y el archivo deja de generarse.
 
-Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js actions/reconcile-moves/reconcile.test.js`.
+Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js actions/reconcile-moves/reconcile.test.js actions/reconcile-moves/reconcile.azure.test.js`.
 
 ### Repos de infra de Azure (`terraform-azure-*.yml`)
 
@@ -387,7 +387,11 @@ Lo que falta respecto a AWS:
   No tiene preparación ni limpieza con la CLI de la nube: el blueprint de Azure no crea nada protegido contra borrado
   ni fuera del estado. El inventario y el resultado salen de los JSON de Terraform (`actions/terraform-azure-destroy`,
   que no llama a Azure) y avisan del borrado suave de Key Vault y API Management. `keep-snapshots` no tiene efecto.
-- **`reconcile-moves` no conoce los tipos de Azure**, así que no empareja nada: un módulo renombrado se planea como destruir y crear.
+- **`reconcile-moves` conoce los tipos de Azure** (consola, doc 40 §22). Los recursos con nombre global (Key Vault, registro,
+  API Management, Static Web App, cuenta de almacenamiento) se emparejan por `name`, como cualquier tipo. Los que solo son
+  únicos dentro de su padre llevan su ámbito: asignaciones de rol (ámbito, rol y principal), secretos del Key Vault, APIs,
+  operaciones y políticas de API Management, Container Apps, identidades, colas y temas de Service Bus, contenedores de
+  blobs. Una asignación de rol cuyo principal solo se conoce tras el apply no se empareja.
 - **No se han ejecutado contra Azure.** Son los workflows de AWS con esas dos piezas cambiadas; su primera ejecución real será la prueba.
 
 
