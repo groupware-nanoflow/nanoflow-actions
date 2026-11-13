@@ -11,6 +11,9 @@
 #      Supabase (doc 11 §19 E9-D6): es el ARN del secreto admin; la CLI del
 #      migrador (misma versión, verificada por sha256) corre en el runner con
 #      DATABASE_URL y APP_DB_PASSWORD leídos de los secretos admin y app.
+#      Supabase en Microsoft Azure (doc 40 §25): es el id del secreto admin en
+#      el Key Vault del ambiente; la misma CLI en el runner, con los secretos
+#      leídos con `az` y la identidad de despliegue del repositorio.
 #   3. bootstrap → status (pendientes) → snapshot si en staging/production hay
 #      una pendiente contract o destructive (no en Supabase: avisa) → apply →
 #      status (estado completo).
@@ -25,7 +28,8 @@
 # Entorno: MODE (apply por defecto | drift), MANIFEST, NF_ENVIRONMENT
 # (development|staging|production, el que resolvió NanoFlow), NF_API_URL,
 # NF_AUDIENCE, MIGRATOR_VERSION,
-# MIGRATOR_BASE_URL (opcional), credenciales AWS de la cuenta del ambiente,
+# MIGRATOR_BASE_URL (opcional), credenciales AWS de la cuenta del ambiente (o,
+# en Azure, la sesión de `az` en la suscripción del ambiente),
 # GITHUB_SHA, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_OUTPUT.
 # Salidas: status (skipped|succeeded|failed) y error ("<base>: <código>").
 #
@@ -176,6 +180,47 @@ supabase_env() {
   echo "::add-mask::${app_password}"
   user=$(jq -r '.username' <<< "$admin")
   echo "Supabase: ${user} en $(jq -r '.host' <<< "$admin") por el session pooler."
+}
+
+# Id sin versión de un secreto de Key Vault: lo que trae
+# NF_DB_<NOMBRE>_MIGRATOR en un proyecto de Microsoft Azure.
+keyvault_secret_re='^https://([a-z0-9][a-z0-9-]{1,22}[a-z0-9])\.vault\.azure\.net/secrets/[A-Za-z0-9-]{1,127}$'
+
+# supabase_env_azure <id del secreto admin>: como supabase_env, con los
+# secretos en el Key Vault del ambiente (doc 40 §25). Los lee la CLI de Azure
+# con la sesión del job: la identidad de despliegue del repositorio dueño de la
+# base tiene lectura de esos dos secretos y de ningún otro. El secreto app debe
+# estar en el mismo Key Vault que el admin.
+supabase_env_azure() {
+  local ref="$1" vault admin app app_ref user pw
+  [[ "$ref" =~ $keyvault_secret_re ]]; vault="${BASH_REMATCH[1]}"
+  if ! command -v az >/dev/null 2>&1; then
+    echo "el runner no tiene la CLI de Azure (az)" > "$work/sb.err"; return 1
+  fi
+  if ! admin=$(az keyvault secret show --id "$ref" --query value --output tsv 2> "$work/sm.err"); then
+    echo "no se pudo leer el secreto admin del Key Vault (la identidad de despliegue de este repositorio debe poder leerlo: construye y aplica la infraestructura con templates ≥ 0.25.0): $(tail -c 300 "$work/sm.err" | tr '\n' ' ')" > "$work/sb.err"; return 1
+  fi
+  if ! jq -e '.engine == "supabase" and (.username | type == "string") and (.password | type == "string" and length > 0) and (.host | type == "string") and (.appSecretRef | type == "string")' <<< "$admin" >/dev/null 2>&1; then
+    echo "el secreto admin no tiene la forma de Supabase o le falta la contraseña (cárgala en NanoFlow → Infraestructura → ${NF_ENVIRONMENT} → Datos y aplica core-infra)" > "$work/sb.err"; return 1
+  fi
+  pw=$(jq -r '.password' <<< "$admin")
+  echo "::add-mask::${pw}"
+  db_url=$(jq -r '"postgresql://\(.username | @uri):\(.password | @uri)@\(.host):\(.port // 5432)/\(.dbname // "postgres" | @uri)?sslmode=\(if (.sslmode // "") | IN("disable", "verify-ca", "verify-full") then .sslmode else "require" end)"' <<< "$admin")
+  echo "::add-mask::${db_url}"
+  app_ref=$(jq -r '.appSecretRef' <<< "$admin")
+  if ! [[ "$app_ref" =~ $keyvault_secret_re ]] || [ "${BASH_REMATCH[1]}" != "$vault" ]; then
+    echo "el secreto admin apunta a un secreto app que no está en el Key Vault del ambiente" > "$work/sb.err"; return 1
+  fi
+  if ! app=$(az keyvault secret show --id "$app_ref" --query value --output tsv 2> "$work/sm.err"); then
+    echo "no se pudo leer el secreto app del Key Vault: $(tail -c 300 "$work/sm.err" | tr '\n' ' ')" > "$work/sb.err"; return 1
+  fi
+  app_password=$(jq -r '.password // ""' <<< "$app" 2>/dev/null || true)
+  if [ -z "$app_password" ]; then
+    echo "el secreto app no tiene contraseña" > "$work/sb.err"; return 1
+  fi
+  echo "::add-mask::${app_password}"
+  user=$(jq -r '.username' <<< "$admin")
+  echo "Supabase: ${user} en $(jq -r '.host' <<< "$admin") por el session pooler (secretos del Key Vault ${vault})."
 }
 
 # kind_of <archivo>: el `-- nanoflow:kind` del encabezado (unknown si falta).
@@ -334,6 +379,15 @@ for i in $(seq 0 $((count - 1))); do
       echo "::endgroup::"
       fail MIGRATOR_NOT_FOUND "$(cat "$work/sb.err")"; break
     fi
+  elif [[ "$fn" =~ $keyvault_secret_re ]]; then
+    # Supabase en Microsoft Azure: la CLI en el runner con los secretos del
+    # Key Vault del ambiente.
+    runner=true
+    ensure_cli
+    if ! supabase_env_azure "$fn"; then
+      echo "::endgroup::"
+      fail MIGRATOR_NOT_FOUND "$(cat "$work/sb.err")"; break
+    fi
   else
     runner=false
     ensure_zip
@@ -419,7 +473,7 @@ for i in $(seq 0 $((count - 1))); do
       case "$k" in contract|destructive) risky="${risky} ${v}(${k})" ;; esac
     done
     if [ -n "$risky" ] && [ "$runner" = true ]; then
-      # AWS no puede crear un snapshot de Supabase (E9-D6).
+      # Ni AWS ni Azure pueden crear un snapshot de Supabase (E9-D6).
       echo "::warning::${db}: hay migraciones${risky} en ${NF_ENVIRONMENT} y Supabase no admite snapshot desde el pipeline. Verifica antes los backups/PITR del proyecto Supabase."
     elif [ -n "$risky" ]; then
       if [ -z "$db_identifier" ]; then

@@ -8,7 +8,9 @@ description: >
   contract/destructive en staging y production (en Supabase solo avisa), e
   informa el resultado a NanoFlow. Sin `databases` no hace nada. Requiere
   credenciales AWS del ambiente y las variables NF_DB_<NOMBRE>_MIGRATOR del
-  GitHub Environment.
+  GitHub Environment. En un proyecto de Microsoft Azure (deploy-azure.yml) la
+  base es Supabase y sus secretos están en el Key Vault del ambiente: los lee
+  con la sesión de `az` del job, sin nada de AWS.
 
 inputs:
   api-url:

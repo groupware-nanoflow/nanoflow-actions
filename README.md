@@ -309,11 +309,17 @@ mismo: el log en vivo y el resultado del despliegue. Lo que cambia:
   `repo:<org>/<repo>:environment:<ambiente>`: sin el GitHub Environment el
   token del job no coincide y Azure lo rechaza.
 - **La identidad puede poco.** Subir imágenes al registro del ambiente,
-  actualizar los Container Apps de los servicios de ese repositorio y, si
-  publica la SPA, leer del Key Vault el token de despliegue de su Static Web
-  App. Nada más: no crea ni borra recursos.
-- **Todavía no hay paso de migraciones.** La clave `databases` no se ejecuta en
-  este workflow.
+  actualizar los Container Apps de los servicios de ese repositorio, leer los
+  secretos de las bases que migra y, si publica la SPA, leer del Key Vault el
+  token de despliegue de su Static Web App. Nada más: no crea ni borra recursos.
+- **Migraciones.** La clave `databases` funciona como en AWS, antes del
+  `deploy`. En Azure la base es Supabase: el migrador corre en el runner y lee
+  del Key Vault del ambiente los secretos admin y app de la base, con la
+  identidad de despliegue del repositorio dueño (la infraestructura le da
+  lectura de esos dos secretos y de ningún otro). `NF_DB_<NOMBRE>_MIGRATOR` es
+  el id de ese secreto admin. No hay snapshot previo (Supabase no lo admite
+  desde el pipeline): avisa, como en AWS. `db-drift.yml` sigue siendo solo de
+  AWS.
 
 Los scripts `build` y `deploy` reciben `AZURE_TENANT_ID`,
 `AZURE_SUBSCRIPTION_ID`, `AZURE_CLIENT_ID`, `AZURE_RESOURCE_GROUP`,
@@ -549,4 +555,7 @@ acciones `azure-infra-env` y `azure-oidc` son archivos nuevos: mover `@v2` para
 incluirlos no cambia ningún archivo que use un repo de AWS. Lo mismo
 `deploy-azure.yml` y la acción `azure-credentials`: los repos de aplicación de
 un proyecto en Azure apuntan a `@v2`; los de AWS siguen en `@v1` con
-`deploy-aws.yml`, que no cambió.
+`deploy-aws.yml`, que no cambió. La acción `db-migrate` ganó una rama para
+los secretos de Supabase en Key Vault (un `NF_DB_<NOMBRE>_MIGRATOR` que es la
+URL de un secreto de Key Vault): es solo código añadido, y un ARN de Secrets
+Manager o el nombre de una Lambda siguen el camino de siempre.

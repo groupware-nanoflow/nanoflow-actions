@@ -5,8 +5,8 @@
 # no entrega credenciales: autoriza y responde identificadores, y el job entra
 # a Azure como la identidad de despliegue de ESTE repositorio (GitHub OIDC).
 #
-# Todavía no migra bases de datos: el paso de migraciones de deploy-aws.yml lee
-# las credenciales de la cuenta de AWS.
+# Las bases Supabase del manifiesto (`databases`) se migran antes del deploy,
+# con sus secretos leídos del Key Vault del ambiente (doc 40 §25).
 #
 # El repositorio del cliente no copia estos pasos, los invoca. Así el pipeline
 # se corrige y se mejora para todos los proyectos con una release de este repo,
@@ -334,8 +334,31 @@ jobs:
 
       # La CLI de Azure pide sus tokens con el token OIDC del job, que dura pocos
       # minutos: tras un build largo ya no podría pedir uno nuevo (registro, Key
-      # Vault). Se entra otra vez justo antes del deploy.
+      # Vault). Se entra otra vez justo antes de las migraciones y del deploy.
       - name: Renovar la sesión de Azure
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/nf-az-login.sh"
+
+      # Migraciones antes del código, como en deploy-aws.yml (doc 11 §14 de la
+      # consola): si el manifiesto declara `databases`, cada base se migra y se
+      # informa a NanoFlow. En Azure la base es Supabase: el migrador corre en
+      # el runner y lee del Key Vault del ambiente los secretos admin y app,
+      # con la identidad de despliegue del repositorio dueño de la base (doc 40
+      # §25). Si falla, no hay deploy: lo que llega es expand/migrate, así que
+      # el código anterior sigue funcionando. Sin `databases` no hace nada.
+      - name: Migraciones
+        id: migrate
+        timeout-minutes: 30
+        uses: groupware-nanoflow/nanoflow-actions/actions/db-migrate@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          manifest: ${{ inputs.manifest }}
+          environment: ${{ steps.azure.outputs.environment }}
+
+      # Unas migraciones largas dejan vencido el token otra vez.
+      - name: Renovar la sesión de Azure antes del deploy
         shell: bash
         run: |
           "$RUNNER_TEMP/nf-az-login.sh"
@@ -368,6 +391,8 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           BUILD_EXIT: ${{ steps.build.outputs.exit-code }}
+          MIGRATE_OUTCOME: ${{ steps.migrate.outcome }}
+          MIGRATE_ERROR: ${{ steps.migrate.outputs.error }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           DEPLOY_EXIT: ${{ steps.deploy.outputs.exit-code }}
           URL: ${{ steps.commands.outputs.url }}
@@ -381,6 +406,8 @@ jobs:
           if [ "$status" = "failure" ]; then
             if [ "$BUILD_OUTCOME" = "failure" ]; then
               error="build: exit ${BUILD_EXIT:-?}"
+            elif [ "$MIGRATE_OUTCOME" = "failure" ]; then
+              error="migrate: ${MIGRATE_ERROR:-falló}"
             elif [ "$DEPLOY_OUTCOME" = "failure" ]; then
               error="deploy: exit ${DEPLOY_EXIT:-?}"
             else
