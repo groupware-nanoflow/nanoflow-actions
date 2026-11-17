@@ -153,7 +153,23 @@ jobs:
         with:
           step: init
           working-directory: ${{ steps.env.outputs.dir }}
-          command: terraform init -input=false -lock-timeout=5m && terraform validate -no-color
+          # En un PR la identidad es de solo lectura. Si el estado del ambiente
+          # todavía no existe (primera construcción), terraform init intenta
+          # crearlo vacío —bloquearlo y escribirlo— y Azure responde 403. Solo
+          # en ese caso el plan sigue contra un estado local vacío, que es lo
+          # mismo que «todavía no hay nada creado»; la identidad sigue sin poder
+          # escribir. Fuera de un PR, el init de siempre.
+          command: >-
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+            out=$(terraform init -input=false -lock=false 2>&1); rc=$?; printf '%s\n' "$out";
+            if [ $rc -ne 0 ]; then
+            printf '%s' "$out" | grep -q 'failed to lock azure state' || exit $rc;
+            echo "::notice::El estado de Terraform de este ambiente todavía no existe (primera construcción). El plan del pull request se calcula contra un estado vacío; el apply lo crea.";
+            printf 'terraform {\n  backend "local" {}\n}\n' > nanoflow_pr_backend_override.tf;
+            terraform init -input=false -reconfigure || exit $?;
+            fi;
+            else terraform init -input=false -lock-timeout=5m || exit $?; fi;
+            terraform validate -no-color
 
       - uses: terraform-linters/setup-tflint@v4
         if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
