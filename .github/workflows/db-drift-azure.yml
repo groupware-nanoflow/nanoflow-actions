@@ -1,0 +1,113 @@
+# Workflow reutilizable de NanoFlow: drift de esquema de las bases Postgres
+# del repo dueño en el ambiente de la rama, para un proyecto de MICROSOFT AZURE
+# (doc 40 de la consola). Es el hermano de db-drift.yml (AWS), que no cambia:
+# los mismos inputs, el mismo reporte a NanoFlow (POST /v1/ci/migrations con
+# kind=drift) y el mismo resultado del job. Cambia cómo entra el job a la nube
+# y de dónde salen las credenciales de la base.
+#
+# Solo lectura: por cada base del manifiesto corre `status` del migrador con
+# los archivos de la rama e informa a NanoFlow si está en sincronía, si hay
+# pendientes o si la base no coincide con el repo. Con Supabase la CLI del
+# migrador corre en el runner y lee del Key Vault del ambiente los secretos
+# admin y app de la base, con la identidad de despliegue de ESTE repositorio
+# (GitHub OIDC; la infraestructura le da lectura de esos dos secretos y de
+# ningún otro). Con PostgreSQL flexible (base privada) el status lo corre el
+# job migrador dentro del ambiente: la acción le deja la petición en su cola y
+# su contenedor, con la misma identidad y sin ningún secreto de la base. Aquí no hay ningún secreto guardado y ninguno
+# se imprime. Lo despacha el mantenimiento diario de NanoFlow
+# (workflow_dispatch con `environment`) a través de
+# .github/workflows/nanoflow-db.yml, que genera el espejo de la arquitectura.
+name: NanoFlow db drift (Azure)
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: Base del API de NanoFlow.
+        required: true
+        type: string
+      audience:
+        description: Audiencia OIDC, p. ej. nanoflow-dev.
+        required: true
+        type: string
+      environment:
+        description: GitHub Environment del ambiente de la rama (development, staging, production).
+        required: true
+        type: string
+      manifest:
+        required: false
+        type: string
+        default: .nanoflow/deploy.yml
+      runs-on:
+        required: false
+        type: string
+        default: ubuntu-latest
+      migrator-version:
+        required: false
+        type: string
+        default: 1.2.0
+
+jobs:
+  drift:
+    runs-on: ${{ inputs.runs-on }}
+    # El GitHub Environment trae las variables NF_DB_<NOMBRE>_MIGRATOR y hace
+    # que el `sub` del token OIDC sea `…:environment:<env>`, lo único en lo que
+    # confía la identidad de despliegue del repositorio.
+    environment: ${{ inputs.environment }}
+    # Con PostgreSQL flexible el status lo corre el job migrador del ambiente
+    # y la acción lo espera hasta 30 min.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: yq
+        shell: bash
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+      # NanoFlow resuelve el ambiente por la rama y responde identificadores;
+      # el job entra a Azure como la identidad de despliegue del repositorio.
+      - name: Credenciales del ambiente
+        id: azure
+        uses: groupware-nanoflow/nanoflow-actions/actions/azure-credentials@v2
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+
+      # Solo las NF_DB_*_MIGRATOR del environment que son el id (sin versión)
+      # de un secreto de Key Vault (Supabase) o la URL de la cola del job
+      # migrador (PostgreSQL flexible, templates ≥ 0.27.0), y las
+      # NF_DEPLOY_MIGRATIONS_*_CONTAINER que son un contenedor de blobs; el
+      # ambiente lo decide NanoFlow por la rama y tiene que ser el declarado.
+      # Solo se imprimen nombres.
+      - name: Migradores del contrato
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ steps.azure.outputs.environment }}
+          DECLARED: ${{ inputs.environment }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          if [ "$DECLARED" != "$ENVIRONMENT" ]; then
+            echo "::error::Se pidió el drift de ${DECLARED}, pero NanoFlow resolvió ${ENVIRONMENT} para esta rama."
+            exit 1
+          fi
+          jq -r 'to_entries[] | select((.key | test("^NF_DB_[A-Z0-9_]+_MIGRATOR$")) and (.value | type == "string") and (.value | test("^https://[a-z0-9][a-z0-9-]{1,22}[a-z0-9]\\.vault\\.azure\\.net/secrets/[A-Za-z0-9-]{1,127}$") or test("^https://[a-z0-9]{3,24}\\.queue\\.core\\.windows\\.net/migrate$"))) | "\(.key)=\(.value)"' <<< "$VARS_JSON" >> "$GITHUB_ENV"
+          jq -r 'to_entries[] | select((.key | test("^NF_DEPLOY_MIGRATIONS_[A-Z0-9_]+_CONTAINER$")) and (.value | type == "string") and (.value | test("^https://[a-z0-9]{3,24}\\.blob\\.core\\.windows\\.net/[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"))) | "\(.key)=\(.value)"' <<< "$VARS_JSON" >> "$GITHUB_ENV"
+          echo "Migradores: $(jq -r '[to_entries[] | select(.key | test("^NF_DB_[A-Z0-9_]+_MIGRATOR$|^NF_DEPLOY_MIGRATIONS_[A-Z0-9_]+_CONTAINER$")) | .key] | join(" ")' <<< "$VARS_JSON")"
+
+      - name: Drift
+        uses: groupware-nanoflow/nanoflow-actions/actions/db-migrate@v2
+        with:
+          mode: drift
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          manifest: ${{ inputs.manifest }}
+          environment: ${{ steps.azure.outputs.environment }}
+          migrator-version: ${{ inputs.migrator-version }}

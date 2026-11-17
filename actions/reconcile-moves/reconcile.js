@@ -58,6 +58,19 @@ const IDENTITY = {
   azurerm_servicebus_subscription: ['topic_id', 'name'],
   azurerm_storage_container: ['storage_account_id', 'name'],
   azurerm_postgresql_flexible_server_database: ['server_id', 'name'],
+  // Dominio propio (templates 0.29.0, azure/domain, azure/identity/keycloak y
+  // azure/frontend/spa; atributos de azurerm 4.81). Una zona de Azure DNS solo
+  // es única en su grupo de recursos, y un registro en su zona; el dominio de
+  // un Container App o de una Static Web App, en su app (el de Static Web Apps
+  // no tiene `name`: sin esto no se emparejaría nunca), y el certificado
+  // administrado, en su entorno.
+  azurerm_dns_zone: ['resource_group_name', 'name'],
+  azurerm_dns_txt_record: ['resource_group_name', 'zone_name', 'name'],
+  azurerm_dns_cname_record: ['resource_group_name', 'zone_name', 'name'],
+  azurerm_dns_a_record: ['resource_group_name', 'zone_name', 'name'],
+  azurerm_container_app_custom_domain: ['container_app_id', 'name'],
+  azurerm_container_app_environment_managed_certificate: ['container_app_environment_id', 'name'],
+  azurerm_static_web_app_custom_domain: ['static_web_app_id', 'domain_name'],
 };
 
 // El resto: el primero presente de estos. `filename` es de `local_file`, para

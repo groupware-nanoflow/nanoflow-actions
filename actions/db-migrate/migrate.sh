@@ -14,6 +14,15 @@
 #      Supabase en Microsoft Azure (doc 40 §25): es el id del secreto admin en
 #      el Key Vault del ambiente; la misma CLI en el runner, con los secretos
 #      leídos con `az` y la identidad de despliegue del repositorio.
+#      PostgreSQL flexible en Microsoft Azure (templates ≥ 0.27.0): es la URL
+#      de la cola `migrate` del job migrador del ambiente
+#      (https://<cuenta>.queue.core.windows.net/migrate). La base es privada:
+#      el runner no la toca. Sube a `requests/<id>/` del contenedor
+#      `migrations` (NF_DEPLOY_MIGRATIONS_<NOMBRE>_CONTAINER, o el de la misma
+#      cuenta) el request.json, la CLI del migrador (verificada por sha256) y
+#      los .sql en un tar.gz; pone <id> en la cola y espera
+#      `results/<id>.json` (hasta QUEUE_WAIT_SECONDS, 30 min). Las respuestas
+#      de cada paso del job pasan por el mismo flujo y el mismo reporte.
 #   3. bootstrap → status (pendientes) → snapshot si en staging/production hay
 #      una pendiente contract o destructive (no en Supabase: avisa) → apply →
 #      status (estado completo).
@@ -130,6 +139,10 @@ invoke() {
 # Usa $files (lista [{name, sql}]) y $dir.
 migrator() {
   local action="$1" with_files="$2" resp="$3" rc
+  if [ "$runner" = queue ]; then
+    queue_step "$action" "$with_files" "$resp"
+    return
+  fi
   if [ "$runner" = false ]; then
     if [ "$with_files" = yes ]; then
       jq -c --arg a "$action" --arg sha "${GITHUB_SHA:-}" '{action: $a, files: .} + (if $a == "apply" then {sha: $sha} else {} end)' "$files" > "$work/p.json"
@@ -221,6 +234,115 @@ supabase_env_azure() {
   echo "::add-mask::${app_password}"
   user=$(jq -r '.username' <<< "$admin")
   echo "Supabase: ${user} en $(jq -r '.host' <<< "$admin") por el session pooler (secretos del Key Vault ${vault})."
+}
+
+# URL de la cola del job migrador de un PostgreSQL flexible en Azure: lo que
+# trae NF_DB_<NOMBRE>_MIGRATOR con templates ≥ 0.27.0.
+queue_migrator_re='^https://([a-z0-9]{3,24})\.queue\.core\.windows\.net/migrate$'
+QUEUE_WAIT_SECONDS="${QUEUE_WAIT_SECONDS:-1800}"
+QUEUE_POLL_SECONDS="${QUEUE_POLL_SECONDS:-15}"
+
+# queue_target <nombre de la base>: deja en $q_account y $q_container la cuenta
+# y el contenedor de peticiones del migrador ($fn es la URL de la cola). El
+# contenedor sale de NF_DEPLOY_MIGRATIONS_<NOMBRE>_CONTAINER si NanoFlow lo
+# escribió (tiene que ser de la misma cuenta) o es `migrations` de esa cuenta.
+queue_target() {
+  local cvar url
+  [[ "$fn" =~ $queue_migrator_re ]]; q_account="${BASH_REMATCH[1]}"
+  q_container=migrations
+  cvar="NF_DEPLOY_MIGRATIONS_$(tr '[:lower:]-' '[:upper:]_' <<< "$1")_CONTAINER"
+  url="${!cvar:-}"
+  if [ -n "$url" ]; then
+    if ! [[ "$url" =~ ^https://([a-z0-9]{3,24})\.blob\.core\.windows\.net/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])$ ]] ||
+       [ "${BASH_REMATCH[1]}" != "$q_account" ]; then
+      echo "${cvar} no es un contenedor de la cuenta de la cola del migrador" > "$work/sb.err"; return 1
+    fi
+    q_container="${BASH_REMATCH[2]}"
+  fi
+  if ! command -v az >/dev/null 2>&1; then
+    echo "el runner no tiene la CLI de Azure (az)" > "$work/sb.err"; return 1
+  fi
+  echo "Migrador en el ambiente: cola migrate y contenedor ${q_container} de la cuenta ${q_account}."
+}
+
+# queue_run <base> <apply|drift>: una ejecución del job migrador. Deja en
+# $work/q/<paso>.json las respuestas que el job trae (bootstrap, before, apply,
+# after) y, si la ejecución no llegó a correr un paso, el motivo en
+# $q_err_code/$q_err_msg. Nunca imprime nada secreto: el job no recibe
+# credenciales del runner, solo el migrador y los .sql.
+queue_run() {
+  local db="$1" mode="$2" id req="$work/qreq" waited=0 exists result="$work/qresult.json"
+  local storage=(--account-name "$q_account" --auth-mode login --only-show-errors --output none)
+  rm -rf "$work/q" "$req"; mkdir -p "$work/q" "$req"
+  q_err_code=""; q_err_msg=""
+  id="${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}-${db}-${mode}-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+  jq -n --arg mode "$mode" --arg sha "${GITHUB_SHA:-}" '{mode: $mode, sha: $sha}' > "$req/request.json"
+  cp "$cli" "$req/db-migrator"
+  (cd "$dir" && find . -maxdepth 1 -type f -name '*.sql' | sed 's|^\./||' | LC_ALL=C sort) > "$work/qlist"
+  if ! tar -czf "$req/migrations.tar.gz" -C "$dir" -T "$work/qlist" 2> "$work/q.err"; then
+    q_err_code=MIGRATOR_UPLOAD_FAILED; q_err_msg="no se pudo empaquetar ${dir}: $(tail -c 300 "$work/q.err" | tr '\n' ' ')"; return 1
+  fi
+  for f in request.json db-migrator migrations.tar.gz; do
+    if ! az storage blob upload --container-name "$q_container" --name "requests/${id}/${f}" --file "$req/$f" --overwrite "${storage[@]}" 2> "$work/q.err"; then
+      q_err_code=MIGRATOR_UPLOAD_FAILED
+      q_err_msg="no se pudo subir la petición al contenedor ${q_container} de ${q_account} (la identidad de despliegue de este repositorio debe poder escribir en él: construye y aplica la infraestructura con templates ≥ 0.27.0): $(tail -c 300 "$work/q.err" | tr '\n' ' ')"
+      return 1
+    fi
+  done
+  if ! az storage message put --queue-name migrate --content "$id" "${storage[@]}" 2> "$work/q.err"; then
+    q_err_code=MIGRATOR_ENQUEUE_FAILED
+    q_err_msg="no se pudo poner la petición en la cola migrate de ${q_account}: $(tail -c 300 "$work/q.err" | tr '\n' ' ')"
+    return 1
+  fi
+  echo "Petición ${id} en la cola; esperando al job migrador (hasta ${QUEUE_WAIT_SECONDS} s)."
+  while :; do
+    if ! exists=$(az storage blob exists --container-name "$q_container" --name "results/${id}.json" --account-name "$q_account" --auth-mode login --only-show-errors --query exists --output tsv 2> "$work/q.err"); then
+      q_err_code=MIGRATOR_RESULT_FAILED
+      q_err_msg="no se pudo leer el resultado del job migrador: $(tail -c 300 "$work/q.err" | tr '\n' ' ')"
+      return 1
+    fi
+    [ "$exists" = true ] && break
+    if [ "$waited" -ge "$QUEUE_WAIT_SECONDS" ]; then
+      q_err_code=MIGRATOR_TIMEOUT
+      q_err_msg="el job migrador no dejó results/${id}.json en ${QUEUE_WAIT_SECONDS} s (revisa el job de Container Apps de la base en el ambiente)"
+      return 1
+    fi
+    sleep "$QUEUE_POLL_SECONDS"; waited=$((waited + QUEUE_POLL_SECONDS))
+  done
+  if ! az storage blob download --container-name "$q_container" --name "results/${id}.json" --file "$result" "${storage[@]}" 2> "$work/q.err" ||
+     ! jq -e --arg id "$id" --arg db "$db" 'type == "object" and .id == $id and .database == $db and (.steps | type == "object")' "$result" >/dev/null 2>&1; then
+    q_err_code=MIGRATOR_RESULT_FAILED
+    q_err_msg="el resultado del job migrador no es el de la petición ${id}"
+    return 1
+  fi
+  for s in bootstrap before apply after; do
+    jq -e --arg s "$s" '.steps[$s] | type == "object" and has("ok")' "$result" >/dev/null 2>&1 &&
+      jq --arg s "$s" '.steps[$s]' "$result" > "$work/q/$s.json"
+  done
+  if [ "$(jq -r '.error // "" | tostring' "$result")" != "" ]; then
+    q_err_code=MIGRATOR_JOB_FAILED
+    q_err_msg="el job migrador falló: $(jq -r '.error | tostring' "$result" | head -c 400)"
+  fi
+  echo "Job migrador: petición ${id} $(jq -r 'if .ok then "terminada" else "con errores" end' "$result")."
+}
+
+# queue_step <acción> <con archivos> <respuesta.json>: la respuesta del paso que
+# el job ya corrió (status con archivos = before, status sin ellos = after).
+queue_step() {
+  local step
+  case "$1:$2" in
+    bootstrap:*) step=bootstrap ;;
+    status:yes) step=before ;;
+    status:no) step=after ;;
+    apply:*) step=apply ;;
+    *) step="$1" ;;
+  esac
+  if [ -f "$work/q/$step.json" ]; then
+    cp "$work/q/$step.json" "$3"
+  else
+    jq -n --arg c "${q_err_code:-MIGRATOR_JOB_FAILED}" --arg m "${q_err_msg:-el job migrador no corrió el paso ${step}}" \
+      '{ok: false, applied: [], pending: [], error: {code: $c, message: $m}}' > "$3"
+  fi
 }
 
 # kind_of <archivo>: el `-- nanoflow:kind` del encabezado (unknown si falta).
@@ -388,6 +510,17 @@ for i in $(seq 0 $((count - 1))); do
       echo "::endgroup::"
       fail MIGRATOR_NOT_FOUND "$(cat "$work/sb.err")"; break
     fi
+  elif [[ "$fn" =~ $queue_migrator_re ]]; then
+    # PostgreSQL flexible en Microsoft Azure: el job migrador del ambiente,
+    # disparado por su cola. Corre todos los pasos de una vez; el flujo de
+    # abajo lee sus respuestas.
+    runner=queue
+    ensure_cli
+    if ! queue_target "$db"; then
+      echo "::endgroup::"
+      fail MIGRATOR_NOT_FOUND "$(cat "$work/sb.err")"; break
+    fi
+    queue_run "$db" "$MODE" || echo "::warning::${db}: ${q_err_msg}"
   else
     runner=false
     ensure_zip
@@ -475,6 +608,10 @@ for i in $(seq 0 $((count - 1))); do
     if [ -n "$risky" ] && [ "$runner" = true ]; then
       # Ni AWS ni Azure pueden crear un snapshot de Supabase (E9-D6).
       echo "::warning::${db}: hay migraciones${risky} en ${NF_ENVIRONMENT} y Supabase no admite snapshot desde el pipeline. Verifica antes los backups/PITR del proyecto Supabase."
+    elif [ -n "$risky" ] && [ "$runner" = queue ]; then
+      # El job migrador corre dentro del ambiente y no crea snapshot: el
+      # servidor flexible tiene restauración a un punto en el tiempo.
+      echo "::warning::${db}: hay migraciones${risky} en ${NF_ENVIRONMENT} y el migrador de Azure no crea snapshot. Si hay que volver atrás, restaura el servidor flexible a un punto en el tiempo anterior a este despliegue."
     elif [ -n "$risky" ]; then
       if [ -z "$db_identifier" ]; then
         echo "::endgroup::"

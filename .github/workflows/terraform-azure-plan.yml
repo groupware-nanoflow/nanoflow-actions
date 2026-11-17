@@ -4,10 +4,21 @@
 # etapas y mismas acciones, salvo cómo se resuelve el ambiente (azure-infra-env)
 # y cómo se entra a la nube (azure-oidc).
 #
-# El ambiente sale de la rama base del PR según .nanoflow/infra.json. Terraform
-# entra con la identidad administrada de PLAN de ese ambiente (solo lectura del
-# grupo de recursos, más el estado), por OIDC nativo de GitHub: sin secretos,
-# sin pasar por NanoFlow y sin poder aplicar nada. El resultado llega a
+# El ambiente sale de la rama base del PR según .nanoflow/infra.json. En un PR
+# Terraform entra con la identidad de PULL REQUEST de ese ambiente
+# (pullRequestClientId; doc 40 de la consola, §33, S5): Reader del grupo de
+# recursos y Storage Blob Data Reader del estado, sin ningún rol sobre el Key
+# Vault. Por eso el plan de un PR va con -refresh=false (refrescar leería los
+# secretos que Terraform gestiona y llamaría acciones de listado que Reader no
+# tiene) y con -lock=false (no puede escribir el bloqueo del estado): el apply
+# vuelve a planear con refresh y el drift diario detecta cambios hechos fuera
+# de Terraform. Nada en un PR necesita el valor de un secreto. La credencial
+# federada de esa identidad solo acepta un PR de este repo que corre ESTE
+# workflow en su tag (job_workflow_ref): ningún otro workflow del repo la
+# obtiene. Un ambiente conectado antes de la plantilla de conexión v1.3.0 no
+# tiene esa identidad: su plan de PR falla con el aviso de cómo arreglarlo.
+# Todo por OIDC nativo de GitHub: sin secretos, sin pasar por NanoFlow y sin
+# poder aplicar nada. El resultado llega a
 # NanoFlow (report-plan) y al PR como comentario. El check falla si fmt,
 # validate, tflint, trivy (HIGH/CRITICAL) o el plan fallan. Un ambiente que
 # NanoFlow destruyó (NF_INFRA_DESTROYED_<AMBIENTE>, doc 29) no se planea.
@@ -87,11 +98,36 @@ jobs:
           terraform_version: ${{ steps.env.outputs.terraform-version }}
           terraform_wrapper: false
 
+      # En un PR, la identidad de solo lectura y un plan sin refresh ni bloqueo.
+      - name: Identidad del plan
+        id: identity
+        if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
+        shell: bash
+        env:
+          NF_EVENT: ${{ github.event_name }}
+          NF_PR_CLIENT_ID: ${{ steps.env.outputs.pr-client-id }}
+          NF_PLAN_CLIENT_ID: ${{ steps.env.outputs.plan-client-id }}
+          NF_ENV: ${{ steps.env.outputs.environment }}
+        run: |
+          set -euo pipefail
+          if [ "$NF_EVENT" = "pull_request" ]; then
+            if [ -z "$NF_PR_CLIENT_ID" ]; then
+              echo "::error::El ambiente ${NF_ENV} se conectó a Azure con una versión anterior de la plantilla de conexión, que no tiene la identidad de solo lectura con la que se planea un pull request. Vuelve a conectar la suscripción del ambiente en NanoFlow (Integraciones → Azure; lo ya creado se reutiliza) y construye la infraestructura de nuevo."
+              exit 1
+            fi
+            echo "client-id=${NF_PR_CLIENT_ID}" >> "$GITHUB_OUTPUT"
+            echo "plan-args=-refresh=false -lock=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Plan de pull request con la identidad de solo lectura: sin refresh y sin bloquear el estado. El apply vuelve a planear con refresh."
+          else
+            echo "client-id=${NF_PLAN_CLIENT_ID}" >> "$GITHUB_OUTPUT"
+            echo "plan-args=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Credenciales de plan
         if: steps.env.outputs.found == 'true' && steps.destroyed.outputs.destroyed != 'true'
         uses: groupware-nanoflow/nanoflow-actions/actions/azure-oidc@v2
         with:
-          client-id: ${{ steps.env.outputs.plan-client-id }}
+          client-id: ${{ steps.identity.outputs.client-id }}
           tenant-id: ${{ steps.env.outputs.tenant-id }}
           subscription-id: ${{ steps.env.outputs.subscription-id }}
 
@@ -175,7 +211,7 @@ jobs:
         with:
           step: plan
           working-directory: ${{ steps.env.outputs.dir }}
-          command: terraform plan -input=false -lock-timeout=5m -no-color ${{ steps.creds.outputs.plan-args }} -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+          command: terraform plan -input=false -lock-timeout=5m -no-color ${{ steps.creds.outputs.plan-args }} ${{ steps.identity.outputs.plan-args }} -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
 
       - name: Emparejar direcciones
         id: reconcile
@@ -194,7 +230,7 @@ jobs:
         with:
           step: plan
           working-directory: ${{ steps.env.outputs.dir }}
-          command: terraform plan -input=false -lock-timeout=5m -no-color ${{ steps.creds.outputs.plan-args }} -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
+          command: terraform plan -input=false -lock-timeout=5m -no-color ${{ steps.creds.outputs.plan-args }} ${{ steps.identity.outputs.plan-args }} -out=tfplan && terraform show -json tfplan > "$RUNNER_TEMP/plan.json"
 
       - name: Informar el plan
         id: report

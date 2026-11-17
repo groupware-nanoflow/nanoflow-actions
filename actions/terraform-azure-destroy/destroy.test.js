@@ -213,3 +213,24 @@ test('inventory avisa de los archivos y los mensajes que se pierden (blueprint 0
   assert.ok(!text.includes('clave-de-la-cuenta') && !text.includes('secreta-del-bus'));
 });
 
+
+test('inventory avisa de que la zona de Azure DNS y su delegación se pierden (templates 0.29.0)', () => {
+  const state = stateFixture();
+  const r = (address, type, values) => ({ address, mode: 'managed', type, name: address.split('.').pop(), values });
+  state.values.root_module.child_modules.push({ address: 'module.domain', resources: [
+    r('module.domain.azurerm_dns_zone.this[0]', 'azurerm_dns_zone', {
+      name: 'dev.shop.example.net', name_servers: ['ns2-01.azure-dns.net.', 'ns1-01.azure-dns.com.'],
+    }),
+    r('module.domain.azurerm_dns_txt_record.validation["_dnsauth"]', 'azurerm_dns_txt_record', { name: '_dnsauth', zone_name: 'dev.shop.example.net', record: [{ value: 'token-de-validacion' }] }),
+  ] });
+  const { inventory: i } = inventory(state, planFixture());
+  assert.deepEqual(i.azure.dnsZones, [{ name: 'dev.shop.example.net', nameServers: ['ns1-01.azure-dns.com.', 'ns2-01.azure-dns.net.'] }]);
+  const w = i.warnings.find((x) => x.includes('zona de Azure DNS dev.shop.example.net'));
+  assert.ok(w && w.includes('delegación') && w.includes('ns1-01.azure-dns.com.'), w);
+  // Las zonas de AWS (Route 53) siguen vacías: su limpieza es otra.
+  assert.deepEqual(i.zones, []);
+  // Sin dominio propio, ni zona ni aviso.
+  const plain = inventory(stateFixture(), planFixture()).inventory;
+  assert.deepEqual(plain.azure.dnsZones, []);
+  assert.ok(!plain.warnings.some((x) => x.includes('Azure DNS')));
+});

@@ -42,6 +42,9 @@ outputs:
   apply-client-id:
     value: ${{ steps.resolve.outputs.apply-client-id }}
     description: Id de cliente de la identidad de apply (solo el job del environment)
+  pr-client-id:
+    value: ${{ steps.resolve.outputs.pr-client-id }}
+    description: Id de cliente de la identidad de solo lectura del plan de un PR ('' si el ambiente se conectó antes de la plantilla de conexión v1.3.0)
   terraform-version:
     value: ${{ steps.resolve.outputs.terraform-version }}
     description: Versión de Terraform del repo

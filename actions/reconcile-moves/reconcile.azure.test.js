@@ -101,6 +101,48 @@ test('Azure: los nombres globales se emparejan por nombre, como cualquier tipo',
   }
 });
 
+test('Azure: el dominio propio (templates 0.29.0) se empareja dentro de su padre', () => {
+  const ZONE = 'stg.shop.example.net';
+  const APP = `${SUB}/resourceGroups/${RG}/providers/Microsoft.App/containerApps/ca-shop-stg-keycloak`;
+  const ENV = `${SUB}/resourceGroups/${RG}/providers/Microsoft.App/managedEnvironments/cae-shop-stg`;
+  const SWA = `${SUB}/resourceGroups/${RG}/providers/Microsoft.Web/staticSites/swa-shop-stg-1a2b`;
+  const { moves, collisions } = reconcile({
+    resource_changes: [
+      // Un dominio escrito a mano (module.dns) que NanoFlow reemplaza por el generado.
+      del('module.dns.azurerm_dns_zone.this', 'azurerm_dns_zone', { resource_group_name: RG, name: ZONE }),
+      del('module.dns.azurerm_dns_txt_record.swa', 'azurerm_dns_txt_record', { resource_group_name: RG, zone_name: ZONE, name: '_dnsauth' }),
+      del('module.dns.azurerm_dns_cname_record.auth', 'azurerm_dns_cname_record', { resource_group_name: RG, zone_name: ZONE, name: 'auth' }),
+      del('module.dns.azurerm_dns_a_record.apex', 'azurerm_dns_a_record', { resource_group_name: RG, zone_name: ZONE, name: '@' }),
+      del('module.kc.azurerm_container_app_custom_domain.auth', 'azurerm_container_app_custom_domain', { container_app_id: APP, name: `auth.${ZONE}` }),
+      del('module.kc.azurerm_container_app_environment_managed_certificate.auth', 'azurerm_container_app_environment_managed_certificate', { container_app_environment_id: ENV, name: 'mc-keycloak', subject_name: `auth.${ZONE}` }),
+      del('module.web.azurerm_static_web_app_custom_domain.this', 'azurerm_static_web_app_custom_domain', { static_web_app_id: SWA, domain_name: ZONE, validation_type: 'dns-txt-token' }),
+      add('module.domain.azurerm_dns_zone.this[0]', 'azurerm_dns_zone', { resource_group_name: RG, name: ZONE }),
+      add('module.domain.azurerm_dns_txt_record.validation["_dnsauth"]', 'azurerm_dns_txt_record', { resource_group_name: RG, zone_name: ZONE, name: '_dnsauth' }),
+      add('module.domain.azurerm_dns_cname_record.auth[0]', 'azurerm_dns_cname_record', { resource_group_name: RG, zone_name: ZONE, name: 'auth' }),
+      add('module.domain.azurerm_dns_a_record.spa[0]', 'azurerm_dns_a_record', { resource_group_name: RG, zone_name: ZONE, name: '@' }),
+      add('module.identity.azurerm_container_app_custom_domain.this[0]', 'azurerm_container_app_custom_domain', { container_app_id: APP, name: `auth.${ZONE}` }),
+      add('module.identity.azurerm_container_app_environment_managed_certificate.this[0]', 'azurerm_container_app_environment_managed_certificate', { container_app_environment_id: ENV, name: 'mc-keycloak', subject_name: `auth.${ZONE}` }),
+      add('module.frontend.azurerm_static_web_app_custom_domain.this[0]', 'azurerm_static_web_app_custom_domain', { static_web_app_id: SWA, domain_name: ZONE, validation_type: 'dns-txt-token' }),
+      // Un registro con el mismo nombre en otra zona es otro registro.
+      del('module.dns.azurerm_dns_txt_record.other', 'azurerm_dns_txt_record', { resource_group_name: RG, zone_name: 'shop.example.net', name: 'asuid.auth' }),
+      add('module.domain.azurerm_dns_txt_record.validation["asuid.auth"]', 'azurerm_dns_txt_record', { resource_group_name: RG, zone_name: ZONE, name: 'asuid.auth' }),
+    ],
+  });
+  assert.deepEqual(collisions, []);
+  assert.deepEqual(moves.map((m) => `${m.from} -> ${m.to}`), [
+    'module.dns.azurerm_dns_a_record.apex -> module.domain.azurerm_dns_a_record.spa[0]',
+    'module.dns.azurerm_dns_cname_record.auth -> module.domain.azurerm_dns_cname_record.auth[0]',
+    'module.dns.azurerm_dns_txt_record.swa -> module.domain.azurerm_dns_txt_record.validation["_dnsauth"]',
+    'module.dns.azurerm_dns_zone.this -> module.domain.azurerm_dns_zone.this[0]',
+    'module.web.azurerm_static_web_app_custom_domain.this -> module.frontend.azurerm_static_web_app_custom_domain.this[0]',
+    'module.kc.azurerm_container_app_custom_domain.auth -> module.identity.azurerm_container_app_custom_domain.this[0]',
+    'module.kc.azurerm_container_app_environment_managed_certificate.auth -> module.identity.azurerm_container_app_environment_managed_certificate.this[0]',
+  ]);
+  // Un dominio de Container App de un app que todavía no existe no se empareja.
+  assert.equal(identityOf(add('a', 'azurerm_container_app_custom_domain', { name: `auth.${ZONE}` }, { container_app_id: true })), null);
+  assert.equal(cloudOf(moves), 'Azure');
+});
+
 test('el comentario nombra la nube de lo que se movió', () => {
   const azure = reconcile(handWritten);
   assert.equal(cloudOf(azure.moves), 'Azure');

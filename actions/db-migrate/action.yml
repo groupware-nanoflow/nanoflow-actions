@@ -10,7 +10,11 @@ description: >
   credenciales AWS del ambiente y las variables NF_DB_<NOMBRE>_MIGRATOR del
   GitHub Environment. En un proyecto de Microsoft Azure (deploy-azure.yml) la
   base es Supabase y sus secretos están en el Key Vault del ambiente: los lee
-  con la sesión de `az` del job, sin nada de AWS.
+  con la sesión de `az` del job, sin nada de AWS. Con PostgreSQL flexible en
+  Azure (NF_DB_<NOMBRE>_MIGRATOR es la URL de la cola del job migrador) la
+  base es privada: deja la petición (CLI verificada, .sql y modo) en el
+  contenedor de migraciones, la pone en la cola, espera el resultado del job
+  (hasta 30 min) y lo informa igual.
 
 inputs:
   api-url:

@@ -58,6 +58,17 @@ refuse "una suscripción que no es un id" "$(mutate '.environments.development.s
 refuse "un directorio de Entra con salto de línea" "$(mutate '.environments.development.tenantId = "aaaaaaaa-0000-4000-8000-aaaaaaaaaaaa\nARM_CLIENT_ID=x"')"
 refuse "sin identidad de apply" "$(mutate 'del(.environments.development.applyClientId)')"
 refuse "la misma identidad para plan y apply" "$(mutate '.environments.development.applyClientId = .environments.development.planClientId')"
+refuse "una identidad de pull request que no es un id" "$(mutate '.environments.development.pullRequestClientId = "x\nARM_CLIENT_ID=y"')"
+refuse "la identidad de plan como la de pull request" "$(mutate '.environments.development.pullRequestClientId = .environments.development.planClientId')"
+refuse "la identidad de apply como la de pull request" "$(mutate '.environments.development.pullRequestClientId = .environments.development.applyClientId')"
+
+run "con identidad de pull request" develop "$(mutate '.environments.development.pullRequestClientId = "11111111-0005-4000-8000-111111111111"')"; rc=$?
+{ [ $rc -eq 0 ] && has "pr-client-id=11111111-0005-4000-8000-111111111111"; }
+check "la identidad de pull request sale cuando el ambiente la tiene" $?
+run "sin identidad de pull request" develop "$good"; rc=$?
+{ [ $rc -eq 0 ] && has "pr-client-id=" && has "plan-client-id=11111111-0001-4000-8000-111111111111"; }
+check "un ambiente conectado antes de v1.3.0 deja pr-client-id vacío y no falla" $?
+
 refuse "un directorio de Terraform fuera de envs/" "$(mutate '.environments.development.dir = "../../etc"')"
 refuse "un grupo de recursos con caracteres de shell" "$(mutate '.environments.development.resourceGroup = "rg; rm -rf /"')"
 refuse "una región de AWS" "$(mutate '.region = "us-east-1"')"

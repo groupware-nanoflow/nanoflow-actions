@@ -318,8 +318,41 @@ mismo: el log en vivo y el resultado del despliegue. Lo que cambia:
   identidad de despliegue del repositorio dueño (la infraestructura le da
   lectura de esos dos secretos y de ningún otro). `NF_DB_<NOMBRE>_MIGRATOR` es
   el id de ese secreto admin. No hay snapshot previo (Supabase no lo admite
-  desde el pipeline): avisa, como en AWS. `db-drift.yml` sigue siendo solo de
-  AWS.
+  desde el pipeline): avisa, como en AWS.
+- **PostgreSQL flexible** (templates ≥ 0.27.0). La base es privada (o, en
+  `minimal`, solo admite servicios de Azure): el runner no se conecta nunca.
+  `NF_DB_<NOMBRE>_MIGRATOR` es la URL de la cola del job migrador del ambiente
+  (`https://<cuenta>.queue.core.windows.net/migrate`) y
+  `NF_DEPLOY_MIGRATIONS_<NOMBRE>_CONTAINER` la del contenedor de peticiones
+  (si falta, `migrations` de la misma cuenta; de otra cuenta se rechaza).
+  `db-migrate` baja y verifica la CLI del migrador como siempre, sube a
+  `requests/<id>/` el `request.json` (`{mode, sha}`), la CLI (`db-migrator`) y
+  los `.sql` en `migrations.tar.gz`, pone `<id>` en la cola y espera
+  `results/<id>.json` hasta 30 min (`QUEUE_WAIT_SECONDS`), todo con
+  `--auth-mode login` y la identidad de despliegue (que tiene *Storage Queue
+  Data Contributor* y *Storage Blob Data Contributor* sobre esa cola y ese
+  contenedor, y ningún secreto de la base). Los pasos del job (`bootstrap`,
+  `before`, `apply`, `after`) pasan por el mismo flujo: mismo reporte, mismo
+  drift, mismo resumen. Sin snapshot antes de un lote `contract`/`destructive`:
+  avisa (el servidor tiene restauración a un punto en el tiempo). Códigos
+  nuevos: `MIGRATOR_UPLOAD_FAILED`, `MIGRATOR_ENQUEUE_FAILED`,
+  `MIGRATOR_RESULT_FAILED`, `MIGRATOR_TIMEOUT` y `MIGRATOR_JOB_FAILED`.
+- **Drift de esquema.** `db-drift.yml` es de AWS; un repositorio dueño de una
+  base en un proyecto de Azure llama a su hermano `db-drift-azure.yml`
+  (`@v2`), con los mismos inputs (`api-url`, `audience`, `environment`,
+  `manifest`, `runs-on`, `migrator-version`). Entra a Azure con
+  `azure-credentials` (la identidad de despliegue del repositorio, dentro del
+  GitHub Environment del ambiente), toma del environment solo las
+  `NF_DB_<NOMBRE>_MIGRATOR` que son el id de un secreto de Key Vault o la URL
+  de la cola de un job migrador (y las `NF_DEPLOY_MIGRATIONS_<NOMBRE>_CONTAINER`),
+  y corre `db-migrate` con `mode: drift`: un `status` de solo lectura por base,
+  con los secretos admin y app leídos del Key Vault y enmascarados (Supabase) o
+  corrido por el job migrador dentro del ambiente (PostgreSQL flexible; el job
+  espera hasta 45 min). El reporte a
+  NanoFlow (`POST /v1/ci/migrations`, `kind: drift`: `in_sync`, `pending` o
+  `mismatch`) y el resultado del job son los de AWS. Lo despacha el
+  mantenimiento diario de NanoFlow por el mismo
+  `.github/workflows/nanoflow-db.yml`.
 
 Los scripts `build` y `deploy` reciben `AZURE_TENANT_ID`,
 `AZURE_SUBSCRIPTION_ID`, `AZURE_CLIENT_ID`, `AZURE_RESOURCE_GROUP`,
@@ -437,7 +470,7 @@ jobs:
   `TF_NAME_COLLISION`). Tras un apply, el estado ya tiene las direcciones
   nuevas y el archivo deja de generarse.
 
-Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js actions/reconcile-moves/reconcile.test.js actions/reconcile-moves/reconcile.azure.test.js`.
+Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js actions/terraform-azure-destroy/destroy.test.js actions/reconcile-moves/reconcile.test.js actions/reconcile-moves/reconcile.azure.test.js`.
 
 ### Repos de infra de Azure (`terraform-azure-*.yml`)
 
@@ -460,11 +493,18 @@ Lo que falta respecto a AWS:
   No tiene preparación ni limpieza con la CLI de la nube: el blueprint de Azure no crea nada protegido contra borrado
   ni fuera del estado. El inventario y el resultado salen de los JSON de Terraform (`actions/terraform-azure-destroy`,
   que no llama a Azure) y avisan del borrado suave de Key Vault y API Management. `keep-snapshots` no tiene efecto.
+  Con un dominio propio en `azure_dns` (templates 0.29.0), el inventario lista la zona (`azure.dnsZones`, con sus
+  servidores de nombres) y avisa de que se borra con sus registros: la delegación del usuario deja de responder y una
+  zona nueva tiene otros servidores. El apply y el destroy dan `id-token: write` al job: el enlace del certificado de
+  Keycloak (`custom-domain.sh` del módulo `azure/identity/keycloak`) canjea el token OIDC del job.
 - **`reconcile-moves` conoce los tipos de Azure** (consola, doc 40 §22). Los recursos con nombre global (Key Vault, registro,
   API Management, Static Web App, cuenta de almacenamiento) se emparejan por `name`, como cualquier tipo. Los que solo son
   únicos dentro de su padre llevan su ámbito: asignaciones de rol (ámbito, rol y principal), secretos del Key Vault, APIs,
   operaciones y políticas de API Management, Container Apps, identidades, colas y temas de Service Bus, contenedores de
-  blobs. Una asignación de rol cuyo principal solo se conoce tras el apply no se empareja.
+  blobs. Una asignación de rol cuyo principal solo se conoce tras el apply no se empareja. Desde la 0.29.0 de las
+  plantillas, también el dominio propio: la zona de Azure DNS (grupo de recursos y nombre), sus registros TXT, CNAME y A
+  (grupo, zona y nombre), el dominio y el certificado administrado de un Container App (app o entorno, y nombre) y el
+  dominio de una Static Web App (app y `domain_name`; no tiene `name`).
 - **No se han ejecutado contra Azure.** Son los workflows de AWS con esas dos piezas cambiadas; su primera ejecución real será la prueba.
 
 
@@ -558,4 +598,16 @@ un proyecto en Azure apuntan a `@v2`; los de AWS siguen en `@v1` con
 `deploy-aws.yml`, que no cambió. La acción `db-migrate` ganó una rama para
 los secretos de Supabase en Key Vault (un `NF_DB_<NOMBRE>_MIGRATOR` que es la
 URL de un secreto de Key Vault): es solo código añadido, y un ARN de Secrets
-Manager o el nombre de una Lambda siguen el camino de siempre.
+Manager o el nombre de una Lambda siguen el camino de siempre. `db-drift-azure.yml`
+es un archivo nuevo que usa esa misma rama en modo `drift`: `db-drift.yml` y
+`migrate.sh` no cambiaron, y mover `@v2` para incluirlo no toca nada de lo que
+usa un repo de AWS. La rama de PostgreSQL flexible (una URL de cola
+`*.queue.core.windows.net/migrate`) también es solo código añadido en
+`migrate.sh` (un `elif` antes del de la Lambda y otro antes del snapshot de
+RDS); las líneas de AWS y de Supabase no cambian.
+
+Pruebas de los scripts de shell (sin red ni nube):
+`bash actions/azure-infra-env/resolve.test.sh`,
+`bash actions/db-migrate/migrate.azure-drift.test.sh` y
+`bash actions/db-migrate/migrate.azure-queue.test.sh` (PostgreSQL flexible:
+la cola del job migrador).

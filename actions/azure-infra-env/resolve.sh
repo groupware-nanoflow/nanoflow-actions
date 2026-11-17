@@ -41,6 +41,9 @@ tenant=$(get '.environments[$e].tenantId')
 group=$(get '.environments[$e].resourceGroup')
 plan=$(get '.environments[$e].planClientId')
 apply=$(get '.environments[$e].applyClientId')
+# La identidad de solo lectura del plan de un PR (plantilla de conexión v1.3.0,
+# doc 40 §33). Opcional: un ambiente conectado antes no la tiene.
+pr=$(get '.environments[$e].pullRequestClientId')
 region=$(get '.region')
 tf=$(get '.terraformVersion')
 
@@ -53,6 +56,10 @@ fail() { echo "::error::$1"; exit 1; }
 [[ "$plan" =~ $guid ]] || fail "identidad de plan inválida"
 [[ "$apply" =~ $guid ]] || fail "identidad de apply inválida"
 [ "$plan" != "$apply" ] || fail "las identidades de plan y de apply no pueden ser la misma"
+if [ -n "$pr" ]; then
+  [[ "$pr" =~ $guid ]] || fail "identidad de pull request inválida"
+  [ "$pr" != "$plan" ] && [ "$pr" != "$apply" ] || fail "la identidad de pull request no puede ser la de plan ni la de apply"
+fi
 [[ "$group" =~ ^[-A-Za-z0-9._()]{1,90}$ ]] || fail "grupo de recursos inválido: $group"
 [[ "$region" =~ ^[a-z][a-z0-9]{2,29}$ ]] || fail "región inválida: $region"
 [[ "$tf" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "versión de Terraform inválida: $tf"
@@ -67,6 +74,7 @@ fail() { echo "::error::$1"; exit 1; }
   echo "region=$region"
   echo "plan-client-id=$plan"
   echo "apply-client-id=$apply"
+  echo "pr-client-id=$pr"
   echo "terraform-version=$tf"
 } >> "$out"
 echo "Rama ${branch} → ${env} (${dir}, suscripción ${subscription}, ${group}, ${region})"

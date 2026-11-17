@@ -345,11 +345,15 @@ jobs:
       # informa a NanoFlow. En Azure la base es Supabase: el migrador corre en
       # el runner y lee del Key Vault del ambiente los secretos admin y app,
       # con la identidad de despliegue del repositorio dueño de la base (doc 40
-      # §25). Si falla, no hay deploy: lo que llega es expand/migrate, así que
+      # §25). Con PostgreSQL flexible (templates ≥ 0.27.0) la base es privada:
+      # migra el job migrador del ambiente, al que la acción deja la petición
+      # en su cola (NF_DB_<NOMBRE>_MIGRATOR) y su contenedor
+      # (NF_DEPLOY_MIGRATIONS_<NOMBRE>_CONTAINER) y espera hasta 30 min.
+      # Si falla, no hay deploy: lo que llega es expand/migrate, así que
       # el código anterior sigue funcionando. Sin `databases` no hace nada.
       - name: Migraciones
         id: migrate
-        timeout-minutes: 30
+        timeout-minutes: 40
         uses: groupware-nanoflow/nanoflow-actions/actions/db-migrate@v2
         with:
           api-url: ${{ inputs.api-url }}

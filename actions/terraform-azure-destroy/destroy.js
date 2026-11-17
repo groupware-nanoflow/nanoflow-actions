@@ -63,6 +63,12 @@ function facts(state) {
     serviceBus: names('azurerm_servicebus_namespace'),
     queues: names('azurerm_servicebus_queue'),
     topics: names('azurerm_servicebus_topic'),
+    // El dominio propio con dns azure_dns (templates 0.29.0): la zona que el
+    // usuario delegó en sus servidores de nombres.
+    dnsZones: of('azurerm_dns_zone').map((v) => ({
+      name: str(v.name),
+      nameServers: (Array.isArray(v.name_servers) ? v.name_servers : []).filter((n) => str(n)).sort(),
+    })).filter((v) => v.name),
   };
 }
 
@@ -105,6 +111,10 @@ function inventory(state, plan) {
   for (const name of f.serviceBus) {
     warnings.push(`Los mensajes sin procesar de Service Bus ${name} (${f.queues.length} colas, ${f.topics.length} temas) se pierden.`);
   }
+  for (const z of f.dnsZones) {
+    const ns = z.nameServers.length ? ` (${z.nameServers.join(', ')})` : '';
+    warnings.push(`La zona de Azure DNS ${z.name} y todos sus registros se borran con el ambiente: la delegación que hiciste en tu proveedor de dominio hacia sus servidores de nombres${ns} deja de responder, y ${z.name} no resuelve hasta que la quites o vuelvas a construir el ambiente (una zona nueva tiene otros servidores y hay que delegarla otra vez).`);
+  }
   warnings.push(...softDeleteWarnings(f));
   return {
     summary: summarize(plan),
@@ -127,6 +137,7 @@ function inventory(state, plan) {
         serviceBus: f.serviceBus,
         queues: f.queues,
         topics: f.topics,
+        dnsZones: f.dnsZones,
       },
       survives: supabaseBases(plan),
       warnings,
