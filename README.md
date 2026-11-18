@@ -100,6 +100,39 @@ NanoFlow escribe el manifiesto y el workflow al conectar el repositorio. El keys
 
 **Los dos workflows.** `deploy-aws.yml` y `deploy-azure.yml` aceptan los mismos `toolchain.java`, `secret-env` y `NF_SECRETS` (Azure, desde el doc 42 §15). Una app iOS los usa en `macos-latest`, con la clave de App Store Connect en `secret-env`. En Azure, el deploy de la app sube los paquetes con `az storage blob upload --auth-mode login` a la cuenta que reciben `NF_MOBILE_BUILDS_ACCOUNT` y `NF_MOBILE_BUILDS_CONTAINER`, con la identidad de despliegue del repo.
 
+### Pruebas de UI de una app (`mobile-ui-tests.yml`)
+
+Doc 42 §16.1 de la consola. NanoFlow agrega `.github/workflows/nanoflow-ui-tests.yml` al conectar un repositorio `android` o `ios`, que llama a este workflow en cada pull request:
+
+```yaml
+jobs:
+  ui-tests:
+    permissions: { contents: read, id-token: write }
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/mobile-ui-tests.yml@v2
+    with:
+      api-url: https://api.nanoflow.example
+      audience: nanoflow-dev
+      platform: android        # o ios, con xcode-project (y xcode-workspace)
+```
+
+- Pide su token OIDC y llama a `POST /v1/ci/mobile-test-session`. NanoFlow responde con:
+  - las `NF_*` de development de la app;
+  - el `appId`;
+  - el usuario de prueba de development (sin el admin).
+
+  **Solo este workflow** recibe la sesión: el endpoint exige `job_workflow_ref` = `…/mobile-ui-tests.yml@…`.
+- Compila el debug de development:
+  - Android: `assembleDevelopmentDebug`, en un emulador con KVM;
+  - iOS: `xcodebuild build -sdk iphonesimulator` con `Config/NanoFlow.xcconfig`, en un simulador de iPhone.
+- Corre `maestro test .maestro --format junit`, con `-e NF_APP_ID`, `-e NF_TEST_USERNAME` y `-e NF_TEST_PASSWORD`. La contraseña se enmascara.
+- Sube el artifact `nanoflow-ui-tests-<plataforma>` con:
+  - `result.json`: `passed`, `failed`, `no-flows` o `setup-failed`, más un mensaje;
+  - `report.xml`;
+  - las capturas.
+
+  Antes de subirlo, quita cualquier archivo que contenga la contraseña. Es la evidencia del evaluador de NanoFlow.
+- Sin flujos en `.maestro/`, termina en verde con `no-flows`.
+
 ### Bases Postgres (`databases`)
 
 Si el repositorio es dueño de una base Postgres de la arquitectura
