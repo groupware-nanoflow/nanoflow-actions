@@ -98,6 +98,8 @@ Para una app nativa Android (doc 42 de la consola):
 
 NanoFlow escribe el manifiesto y el workflow al conectar el repositorio. El keystore lo genera NanoFlow una sola vez y lo guarda cifrado.
 
+**Los dos workflows.** `deploy-aws.yml` y `deploy-azure.yml` aceptan los mismos `toolchain.java`, `secret-env` y `NF_SECRETS` (Azure, desde el doc 42 §15). Una app iOS los usa en `macos-latest`, con la clave de App Store Connect en `secret-env`. En Azure, el deploy de la app sube los paquetes con `az storage blob upload --auth-mode login` a la cuenta que reciben `NF_MOBILE_BUILDS_ACCOUNT` y `NF_MOBILE_BUILDS_CONTAINER`, con la identidad de despliegue del repo.
+
 ### Bases Postgres (`databases`)
 
 Si el repositorio es dueño de una base Postgres de la arquitectura

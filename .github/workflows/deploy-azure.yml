@@ -53,6 +53,16 @@ on:
           los jobs que corren dentro del GitHub Environment del ambiente.
         required: true
         type: string
+    secrets:
+      NF_SECRETS:
+        description: >
+          Los secretos del job que llama, en JSON (`toJSON(secrets)`): un
+          workflow reutilizable solo ve los que se le pasan. Al build y al
+          deploy llegan únicamente los nombres que el manifiesto lista en
+          `secret-env` (el keystore de una app Android o la clave de App Store
+          Connect de una app iOS, doc 42 de la consola), enmascarados. Sin él,
+          como antes.
+        required: false
 
 jobs:
   deploy:
@@ -88,6 +98,7 @@ jobs:
             echo "node=$(yq -r '.toolchain.node // ""' "$MANIFEST")"
             echo "go=$(yq -r '.toolchain.go // ""' "$MANIFEST")"
             echo "python=$(yq -r '.toolchain.python // ""' "$MANIFEST")"
+            echo "java=$(yq -r '.toolchain.java // ""' "$MANIFEST")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Credenciales del ambiente
@@ -225,6 +236,54 @@ jobs:
         if: steps.manifest.outputs.python != ''
         with:
           python-version: ${{ steps.manifest.outputs.python }}
+
+      # Una app Android (doc 42 de la consola): el JDK del manifiesto; el SDK de
+      # Android ya viene en ubuntu-latest (ANDROID_HOME).
+      - uses: actions/setup-java@v4
+        if: steps.manifest.outputs.java != ''
+        with:
+          distribution: temurin
+          java-version: ${{ steps.manifest.outputs.java }}
+          cache: gradle
+
+      # Los secretos que el manifiesto pide (`secret-env`, p. ej.
+      # NF_ANDROID_KEYSTORE): solo esos nombres, desde NF_SECRETS, enmascarados.
+      # Sin `secret-env` o sin NF_SECRETS no hace nada.
+      - name: Secretos del build
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          NF_SECRETS: ${{ secrets.NF_SECRETS }}
+        run: |
+          set -euo pipefail
+          names=$(
+            case "$(yq -r '.["secret-env"] | tag' "$MANIFEST")" in
+              '!!seq') yq -r '.["secret-env"][]' "$MANIFEST" ;;
+              '!!str') yq -r '.["secret-env"]' "$MANIFEST" | tr ', ' '\n\n' ;;
+            esac | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u || true
+          )
+          [ -n "$names" ] || exit 0
+          if [ -z "${NF_SECRETS:-}" ]; then
+            echo "::warning::El manifiesto pide secretos (secret-env) pero el workflow del repositorio no pasa NF_SECRETS: vuelve a conectar el repositorio desde NanoFlow."
+            exit 0
+          fi
+          while IFS= read -r name; do
+            if [[ "$name" =~ ^(AWS_|GITHUB_|ACTIONS_|RUNNER_) ]]; then
+              echo "::warning::secret-env: '${name}' es reservado; se ignora."
+              continue
+            fi
+            if [ "$(jq --arg n "$name" 'has($n)' <<< "$NF_SECRETS")" != true ]; then
+              echo "::warning::secret-env: el secreto ${name} no existe en el repositorio ni en su environment."
+              continue
+            fi
+            value=$(jq -r --arg n "$name" '.[$n]' <<< "$NF_SECRETS")
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::add-mask::${line}"
+            done <<< "$value"
+            delim="__NF_$(openssl rand -hex 8)__"
+            { echo "${name}<<${delim}"; echo "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+            echo "  ${name} (secreto)"
+          done <<< "$names"
 
       # Los comandos del manifiesto se pasan por variable de entorno y se
       # ejecutan desde un archivo, no interpolados dentro del `run`. Interpolar
