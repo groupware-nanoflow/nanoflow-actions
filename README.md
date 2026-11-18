@@ -89,6 +89,15 @@ el de la rama; si no, falla. El `deploy.yml` que genera NanoFlow ya lo pasa:
       environment: ${{ github.ref_name == 'develop' && 'development' || github.ref_name == 'main' && 'production' || '' }}
 ```
 
+### Apps Android y secretos del build (`toolchain.java`, `secret-env`)
+
+Para una app nativa Android (doc 42 de la consola):
+
+- `toolchain: { java: "17" }` instala el JDK con cache de Gradle. El SDK de Android ya viene en `ubuntu-latest`.
+- `secret-env: [NF_ANDROID_KEYSTORE, NF_ANDROID_KEYSTORE_PASSWORD]` exporta al build y al deploy **solo esos** secretos, enmascarados. El workflow del repositorio los pasa en `secrets: { NF_SECRETS: ${{ toJSON(secrets) }} }`, porque un workflow reutilizable solo ve lo que recibe. Los nombres reservados (`AWS_*`, `GITHUB_*`, `ACTIONS_*`, `RUNNER_*`) se ignoran.
+
+NanoFlow escribe el manifiesto y el workflow al conectar el repositorio. El keystore lo genera NanoFlow una sola vez y lo guarda cifrado.
+
 ### Bases Postgres (`databases`)
 
 Si el repositorio es dueño de una base Postgres de la arquitectura
