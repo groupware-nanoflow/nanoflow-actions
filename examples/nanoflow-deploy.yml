@@ -24,6 +24,12 @@ url: https://dev.app.example.com
 # en vivo antes de salir del runner. Las credenciales de AWS se tapan siempre.
 # mask-env: [DB_PASSWORD, STRIPE_KEY]
 
+# Opcional: las bases Postgres de las que este repo es dueño (data[].owner).
+# Se migran después del build y antes del deploy; ver README «Bases Postgres».
+# databases:
+#   - name: app-db
+#     migrations: db/migrations
+
 # Opcional: un ambiente puede sobrescribir build, deploy y url (y sumar
 # mask-env). Se resuelve después de que NanoFlow decide el ambiente a partir de
 # la rama.

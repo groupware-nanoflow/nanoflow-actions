@@ -1,0 +1,61 @@
+name: NanoFlow reconcile moves
+description: >
+  Empareja, en el plan de Terraform, cada recurso que se destruye con el que se
+  crea del mismo tipo y el mismo nombre físico (un módulo renombrado, Terraform
+  escrito a mano que NanoFlow reemplazó) y los escribe como bloques `moved` en
+  nanoflow_moved.tf, sin versionar, para volver a planear. Los grupos que no son
+  1:1 son colisiones: el que llama decide (el plan falla, el apply no corre).
+  Consola, doc 32 §8.1.
+
+inputs:
+  plan-json:
+    description: Salida de `terraform show -json tfplan`.
+    required: true
+  working-directory:
+    description: Directorio raíz de Terraform del ambiente (donde se escribe nanoflow_moved.tf).
+    required: true
+
+outputs:
+  moved:
+    description: Cantidad de bloques `moved` escritos (0 = no hay archivo nuevo).
+    value: ${{ steps.reconcile.outputs.moved }}
+  collisions:
+    description: Cantidad de grupos con el mismo nombre físico que no son 1:1.
+    value: ${{ steps.reconcile.outputs.collisions }}
+  summary-file:
+    description: Markdown con los movidos y las colisiones (vacío si no hay nada).
+    value: ${{ steps.reconcile.outputs.summary-file }}
+  message:
+    description: Mensaje de una línea de las colisiones (vacío si no hay).
+    value: ${{ steps.reconcile.outputs.message }}
+
+runs:
+  using: composite
+  steps:
+    - id: reconcile
+      shell: bash
+      env:
+        NF_PLAN: ${{ inputs.plan-json }}
+        NF_DIR: ${{ inputs.working-directory }}
+        NF_SCRIPT: ${{ github.action_path }}/reconcile.js
+      run: |
+        set -euo pipefail
+        out="$RUNNER_TEMP/nf-moves"
+        mkdir -p "$out"
+        rm -f "$out/summary.md" "$out/message.txt"
+        counts=$(node "$NF_SCRIPT" "$NF_PLAN" --dir "$NF_DIR" --summary "$out/summary.md" --message "$out/message.txt")
+        echo "$counts"
+        moved=$(sed -n 's/^moved=\([0-9]*\) .*/\1/p' <<<"$counts")
+        collisions=$(sed -n 's/.* collisions=\([0-9]*\)$/\1/p' <<<"$counts")
+        if [ "${moved:-0}" -gt 0 ]; then
+          echo "::notice::NanoFlow movió ${moved} recurso(s) de dirección para no destruir y volver a crear el mismo nombre físico (nanoflow_moved.tf, sin versionar)."
+          cat "$NF_DIR/nanoflow_moved.tf"
+        fi
+        message=''
+        [ -s "$out/message.txt" ] && message=$(head -n 1 "$out/message.txt")
+        {
+          echo "moved=${moved:-0}"
+          echo "collisions=${collisions:-0}"
+          echo "summary-file=$out/summary.md"
+          echo "message=${message}"
+        } >> "$GITHUB_OUTPUT"

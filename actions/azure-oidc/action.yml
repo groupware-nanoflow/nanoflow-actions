@@ -1,0 +1,47 @@
+name: NanoFlow Azure OIDC
+description: >
+  Deja el job listo para que Terraform entre a Azure con el token OIDC de
+  GitHub, sin secretos: escribe en el entorno las variables ARM_* que leen el
+  proveedor azurerm y su backend. El canje lo hace Terraform contra la
+  identidad administrada indicada, cuya credencial federada decide qué
+  workflow, rama o environment puede usarla. Aquí no hay ningún secreto: los
+  tres valores son identificadores.
+
+inputs:
+  client-id:
+    description: Id de cliente de la identidad administrada (plan o apply).
+    required: true
+  tenant-id:
+    description: Directorio de Entra ID de la suscripción.
+    required: true
+  subscription-id:
+    description: Suscripción de Azure del ambiente.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        NF_CLIENT_ID: ${{ inputs.client-id }}
+        NF_TENANT_ID: ${{ inputs.tenant-id }}
+        NF_SUBSCRIPTION_ID: ${{ inputs.subscription-id }}
+      run: |
+        set -euo pipefail
+        guid='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        for v in "$NF_CLIENT_ID" "$NF_TENANT_ID" "$NF_SUBSCRIPTION_ID"; do
+          [[ "$v" =~ $guid ]] || { echo "::error::Identificador de Azure inválido: el job no puede entrar a Azure."; exit 1; }
+        done
+        # El job necesita `id-token: write`: sin él GitHub no entrega el token.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::El job no tiene permiso id-token: write, así que no puede pedir el token OIDC con el que se entra a Azure."
+          exit 1
+        fi
+        {
+          echo "ARM_USE_OIDC=true"
+          echo "ARM_USE_AZUREAD=true"
+          echo "ARM_CLIENT_ID=${NF_CLIENT_ID}"
+          echo "ARM_TENANT_ID=${NF_TENANT_ID}"
+          echo "ARM_SUBSCRIPTION_ID=${NF_SUBSCRIPTION_ID}"
+        } >> "$GITHUB_ENV"
+        echo "Terraform entrará a Azure como la identidad ${NF_CLIENT_ID} (suscripción ${NF_SUBSCRIPTION_ID})."

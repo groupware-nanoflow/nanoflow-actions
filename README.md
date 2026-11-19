@@ -70,6 +70,148 @@ Dos claves opcionales más, en la raíz o por ambiente:
 |---|---|
 | `url` | URL pública de lo desplegado; NanoFlow la guarda cuando el despliegue sale bien |
 | `mask-env` | variables de entorno cuyos valores se tapan en el log en vivo (lista o texto separado por comas) |
+| `env-map` | `DESTINO: NF_ORIGEN`: copia una variable del contrato de plataforma con otro nombre para el build (p. ej. `VITE_API_URL: NF_API_URL`). Lo del ambiente gana sobre la raíz. |
+
+### Contrato de plataforma (`environment`)
+
+Con el input `environment` (el GitHub Environment del ambiente de la rama:
+`development`, `staging` o `production`), el job corre dentro de ese
+environment. Ahí NanoFlow escribe las variables `NF_*` del contrato de
+plataforma: `NF_API_URL`, `NF_FRONTEND_URL`, `NF_IDENTITY_PROVIDER`,
+`NF_OIDC_ISSUER`, `NF_OIDC_AUDIENCE`, `NF_OIDC_CLIENT_ID`, `NF_TENANT_CLAIM`,
+`NF_ENVIRONMENT`… (salen de los outputs del apply del repo core-infra; doc 11
+§11 de la consola). El paso «Contrato de plataforma» las exporta a build y
+deploy y aplica `env-map`. NanoFlow comprueba que el environment declarado sea
+el de la rama; si no, falla. El `deploy.yml` que genera NanoFlow ya lo pasa:
+
+```yaml
+    with:
+      environment: ${{ github.ref_name == 'develop' && 'development' || github.ref_name == 'main' && 'production' || '' }}
+```
+
+### Apps Android y secretos del build (`toolchain.java`, `secret-env`)
+
+Para una app nativa Android (doc 42 de la consola):
+
+- `toolchain: { java: "17" }` instala el JDK con cache de Gradle. El SDK de Android ya viene en `ubuntu-latest`.
+- `secret-env: [NF_ANDROID_KEYSTORE, NF_ANDROID_KEYSTORE_PASSWORD]` exporta al build y al deploy **solo esos** secretos, enmascarados. El workflow del repositorio los pasa en `secrets: { NF_SECRETS: ${{ toJSON(secrets) }} }`, porque un workflow reutilizable solo ve lo que recibe. Los nombres reservados (`AWS_*`, `GITHUB_*`, `ACTIONS_*`, `RUNNER_*`) se ignoran.
+
+NanoFlow escribe el manifiesto y el workflow al conectar el repositorio. El keystore lo genera NanoFlow una sola vez y lo guarda cifrado.
+
+**Los dos workflows.** `deploy-aws.yml` y `deploy-azure.yml` aceptan los mismos `toolchain.java`, `secret-env` y `NF_SECRETS` (Azure, desde el doc 42 §15). Una app iOS los usa en `macos-latest`, con la clave de App Store Connect en `secret-env`. En Azure, el deploy de la app sube los paquetes con `az storage blob upload --auth-mode login` a la cuenta que reciben `NF_MOBILE_BUILDS_ACCOUNT` y `NF_MOBILE_BUILDS_CONTAINER`, con la identidad de despliegue del repo.
+
+### Pruebas de UI de una app (`mobile-ui-tests.yml`)
+
+Doc 42 §16.1 de la consola. NanoFlow agrega `.github/workflows/nanoflow-ui-tests.yml` al conectar un repositorio `android` o `ios`, que llama a este workflow en cada pull request:
+
+```yaml
+jobs:
+  ui-tests:
+    permissions: { contents: read, id-token: write }
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/mobile-ui-tests.yml@v2
+    with:
+      api-url: https://api.nanoflow.example
+      audience: nanoflow-dev
+      platform: android        # o ios, con xcode-project (y xcode-workspace)
+```
+
+- Pide su token OIDC y llama a `POST /v1/ci/mobile-test-session`. NanoFlow responde con:
+  - las `NF_*` de development de la app;
+  - el `appId`;
+  - el usuario de prueba de development (sin el admin).
+
+  **Solo este workflow** recibe la sesión: el endpoint exige `job_workflow_ref` = `…/mobile-ui-tests.yml@…`.
+- Compila el debug de development:
+  - Android: `assembleDevelopmentDebug`, en un emulador con KVM;
+  - iOS: `xcodebuild build -sdk iphonesimulator` con `Config/NanoFlow.xcconfig`, en un simulador de iPhone.
+- Corre `maestro test .maestro --format junit`, con `-e NF_APP_ID`, `-e NF_TEST_USERNAME` y `-e NF_TEST_PASSWORD`. La contraseña se enmascara.
+- Sube el artifact `nanoflow-ui-tests-<plataforma>` con:
+  - `result.json`: `passed`, `failed`, `no-flows` o `setup-failed`, más un mensaje;
+  - `report.xml`;
+  - las capturas.
+
+  Antes de subirlo, quita cualquier archivo que contenga la contraseña. Es la evidencia del evaluador de NanoFlow.
+- Sin flujos en `.maestro/`, termina en verde con `no-flows`.
+
+### Bases Postgres (`databases`)
+
+Si el repositorio es dueño de una base Postgres de la arquitectura
+(`data[].owner`), el manifiesto la declara y `deploy-aws` la migra **después
+del build y antes del deploy** (doc 11 §14 de la consola):
+
+```yaml
+databases:
+  - name: app-db              # data[].name de la arquitectura
+    migrations: db/migrations # NNNN_<slug>.sql, por defecto db/migrations
+```
+
+El paso «Migraciones» (acción `db-migrate`) hace lo siguiente por cada base:
+1. Encuentra su migrador en `NF_DB_<NOMBRE>_MIGRATOR`. Es una variable del contrato de
+   plataforma que NanoFlow escribe solo en el repo dueño.
+2. Instala la versión fijada de `nanoflow-db-migrator`, desde el bucket público de NanoFlow y
+   verificada por sha256:
+   - **RDS/Aurora**: la variable es el nombre de la Lambda migradora de la VPC, y el código va a
+     esa Lambda.
+   - **Supabase** (doc 11 §19): la variable es el ARN del secreto `admin` de la base. La CLI corre
+     en el runner con la conexión del session pooler y la contraseña de `app_rw`, que lee de los
+     secretos `admin` y `app` de la cuenta del ambiente. Ambas se enmascaran.
+3. Corre `bootstrap` y luego `status` para conocer las pendientes.
+4. En staging y production, si alguna pendiente es `contract` o `destructive`, crea un **snapshot**
+   de la base y espera a que esté disponible. En Supabase no hay snapshot desde el pipeline: deja
+   un aviso para verificar los backups/PITR del proyecto.
+5. Corre `apply` con el commit del push. Antes de ejecutar nada, el migrador (1.2.0+) rechaza los
+   nombres inválidos y los objetos fuera del schema `app` (`INVALID_NAME`, `SCHEMA_NOT_APP`: las
+   migraciones corren como `app_owner`, dueño solo de `app`) y deja un `::warning::` por cada
+   migración sin cabecera `-- nanoflow:kind` (se aplica como `unknown`).
+6. Informa a NanoFlow (`POST /v1/ci/migrations`): el resultado y el estado completo del esquema.
+
+Si una migración falla, no hay deploy y el despliegue queda con el error `migrate: <base>:
+<código>`. Todo lo que llega es `expand` o `migrate`, así que el código anterior sigue
+funcionando con el esquema que quedó. El reporte nunca hace fallar el paso. Sin `databases`, el
+paso no hace nada.
+
+**En los PRs**, el workflow reutilizable `db-check.yml` revisa las migraciones sin tocar ninguna
+base real. Lo hace contra un Postgres 16 del propio job y sin credenciales de AWS ni de NanoFlow:
+- `db-migrator lint`:
+  - nombres y numeración;
+  - todo objeto en el schema `app` y calificado (`SCHEMA_NOT_APP`);
+  - las migraciones de la rama base no se editan, borran ni renombran;
+  - `-- nanoflow:kind` obligatorio y no menor que lo que hace el SQL.
+- **squawk** 2.66.0 sobre las migraciones nuevas. Las reglas de drop y rename solo se permiten en
+  un `contract` o `destructive` declarado.
+- **apply desde cero.**
+- **Aislamiento por tenant** (RLS forzado, `tenant_id NOT NULL`, policies), si la arquitectura
+  dice `multiTenancy: pool`.
+
+```yaml
+on:
+  pull_request:   # sin filtro de paths: el gate de la promoción exige el check
+jobs:
+  db-check:
+    permissions:
+      contents: read
+      id-token: write
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/db-check.yml@v1
+    with:
+      api-url: https://devapi-nanoflow.groupware.com.co
+      audience: nanoflow-dev
+```
+
+Con `api-url`, en un `pull_request`, `db-check` informa a NanoFlow el resultado de cada base
+(`kind: check`): las migraciones nuevas frente a la rama base, con su kind. Es el **dry-run de la
+promoción**: el PR de promoción apunta a la rama del ambiente destino, y NanoFlow no mergea la
+promoción sin un check verde de ese head. Además exige la confirmación de las `destructive` y, en
+producción, la casilla del aprobador para las `contract`/`destructive` (doc 11 §16).
+
+**Drift de esquema.** El workflow reutilizable `db-drift.yml` no migra nada:
+- Solo lectura: por cada base invoca `status` en su migrador con los archivos de la rama.
+- Informa `in_sync`, `pending` (archivos sin aplicar) o `mismatch` (una versión aplicada cambió o no
+  está en el repo; falla el job).
+- Lo despacha el mantenimiento diario de NanoFlow.
+
+El repo dueño no escribe estos workflows: el espejo de la arquitectura genera
+`.github/workflows/nanoflow-db.yml`, que llama a `db-check.yml` en cada PR y a `db-drift.yml` en un
+`workflow_dispatch` con `environment`.
 
 ## Qué ve NanoFlow del despliegue
 
@@ -86,10 +228,14 @@ OIDC de las credenciales:
    `failure` (con el paso y el código de salida, p. ej. `deploy: exit 1`) o
    `cancelled`, y la `url` del manifiesto si salió bien.
 
-Ninguno de los dos puede fallar el despliegue. Si NanoFlow no responde, el log
-en vivo se descarta con un único `::warning::` al final del paso y el reporte
-deja otro aviso; el log completo sigue en GitHub y NanoFlow lo archiva al
-terminar el job. Para no reenviar la salida, `live-logs: false`.
+Ninguno de los dos puede fallar el despliegue. Si NanoFlow deja de responder
+(tres lotes seguidos sin llegar, o un rechazo 401/403/404), el log en vivo hace
+una pausa —30 s, o 60 s ante un rechazo—, lo avisa en ese momento con un
+`::warning::` y vuelve a intentar; las líneas esperan en cola (hasta 20 000) y,
+cuando la API vuelve, se envían y un `::notice::` lo dice. Lo que no llegue antes
+de que termine el paso se descarta con un `::warning::` final, y el reporte deja
+otro aviso; el log completo sigue en GitHub y NanoFlow lo archiva al terminar el
+job. Para no reenviar la salida, `live-logs: false`.
 
 El ambiente tampoco aquí lo manda el workflow: NanoFlow lo deriva de la rama
 firmada en el token, igual que las credenciales.
@@ -171,6 +317,112 @@ pero un `failure` después de un `success` (o un `in_progress`) se rechaza con u
 aviso. Solo `push`, `workflow_dispatch` y `release` desde una rama con ambiente
 pueden informar un despliegue.
 
+## Desplegar en Microsoft Azure (`deploy-azure.yml`)
+
+Un proyecto cuya arquitectura está en Azure tiene, por ambiente, una
+suscripción en lugar de una cuenta AWS. Sus repositorios de aplicación llaman a
+`deploy-azure.yml` (NanoFlow escribe ese workflow al conectar el repositorio a
+la infraestructura):
+
+```yaml
+jobs:
+  deploy:
+    permissions:
+      contents: read
+      id-token: write
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/deploy-azure.yml@v2
+    with:
+      api-url: https://devapi-nanoflow.groupware.com.co
+      audience: nanoflow-dev
+      environment: ${{ github.ref_name == 'develop' && 'development' || '' }}
+```
+
+El manifiesto `.nanoflow/deploy.yml` es el mismo (`build`, `deploy`, `env-map`,
+`url`, `mask-env`, por ambiente o en la raíz) y el job informa a NanoFlow lo
+mismo: el log en vivo y el resultado del despliegue. Lo que cambia:
+
+- **NanoFlow no entrega credenciales.** `POST /v1/ci/azure-session` hace las
+  mismas comprobaciones que en AWS (repositorio, rama → ambiente, promoción
+  aprobada, infraestructura no destruida) y responde solo identificadores: el
+  directorio, la suscripción, el grupo de recursos y el id de cliente de la
+  **identidad de despliegue de ese repositorio**, que creó Terraform al aplicar
+  la infraestructura. El job entra a Azure canjeando su propio token OIDC por
+  esa identidad (`az login --federated-token`), que solo confía en ese
+  repositorio dentro del GitHub Environment del ambiente.
+- **`environment` es obligatorio.** La identidad de despliegue confía en
+  `repo:<org>/<repo>:environment:<ambiente>`: sin el GitHub Environment el
+  token del job no coincide y Azure lo rechaza.
+- **La identidad puede poco.** Subir imágenes al registro del ambiente,
+  actualizar los Container Apps de los servicios de ese repositorio, leer los
+  secretos de las bases que migra y, si publica la SPA, leer del Key Vault el
+  token de despliegue de su Static Web App. Nada más: no crea ni borra recursos.
+- **Migraciones.** La clave `databases` funciona como en AWS, antes del
+  `deploy`. En Azure la base es Supabase: el migrador corre en el runner y lee
+  del Key Vault del ambiente los secretos admin y app de la base, con la
+  identidad de despliegue del repositorio dueño (la infraestructura le da
+  lectura de esos dos secretos y de ningún otro). `NF_DB_<NOMBRE>_MIGRATOR` es
+  el id de ese secreto admin. No hay snapshot previo (Supabase no lo admite
+  desde el pipeline): avisa, como en AWS.
+- **PostgreSQL flexible** (templates ≥ 0.27.0). La base es privada (o, en
+  `minimal`, solo admite servicios de Azure): el runner no se conecta nunca.
+  `NF_DB_<NOMBRE>_MIGRATOR` es la URL de la cola del job migrador del ambiente
+  (`https://<cuenta>.queue.core.windows.net/migrate`) y
+  `NF_DEPLOY_MIGRATIONS_<NOMBRE>_CONTAINER` la del contenedor de peticiones
+  (si falta, `migrations` de la misma cuenta; de otra cuenta se rechaza).
+  `db-migrate` baja y verifica la CLI del migrador como siempre, sube a
+  `requests/<id>/` el `request.json` (`{mode, sha}`), la CLI (`db-migrator`) y
+  los `.sql` en `migrations.tar.gz`, pone `<id>` en la cola y espera
+  `results/<id>.json` hasta 30 min (`QUEUE_WAIT_SECONDS`), todo con
+  `--auth-mode login` y la identidad de despliegue (que tiene *Storage Queue
+  Data Contributor* y *Storage Blob Data Contributor* sobre esa cola y ese
+  contenedor, y ningún secreto de la base). Los pasos del job (`bootstrap`,
+  `before`, `apply`, `after`) pasan por el mismo flujo: mismo reporte, mismo
+  drift, mismo resumen. Sin snapshot antes de un lote `contract`/`destructive`:
+  avisa (el servidor tiene restauración a un punto en el tiempo). Códigos
+  nuevos: `MIGRATOR_UPLOAD_FAILED`, `MIGRATOR_ENQUEUE_FAILED`,
+  `MIGRATOR_RESULT_FAILED`, `MIGRATOR_TIMEOUT` y `MIGRATOR_JOB_FAILED`.
+- **Drift de esquema.** `db-drift.yml` es de AWS; un repositorio dueño de una
+  base en un proyecto de Azure llama a su hermano `db-drift-azure.yml`
+  (`@v2`), con los mismos inputs (`api-url`, `audience`, `environment`,
+  `manifest`, `runs-on`, `migrator-version`). Entra a Azure con
+  `azure-credentials` (la identidad de despliegue del repositorio, dentro del
+  GitHub Environment del ambiente), toma del environment solo las
+  `NF_DB_<NOMBRE>_MIGRATOR` que son el id de un secreto de Key Vault o la URL
+  de la cola de un job migrador (y las `NF_DEPLOY_MIGRATIONS_<NOMBRE>_CONTAINER`),
+  y corre `db-migrate` con `mode: drift`: un `status` de solo lectura por base,
+  con los secretos admin y app leídos del Key Vault y enmascarados (Supabase) o
+  corrido por el job migrador dentro del ambiente (PostgreSQL flexible; el job
+  espera hasta 45 min). El reporte a
+  NanoFlow (`POST /v1/ci/migrations`, `kind: drift`: `in_sync`, `pending` o
+  `mismatch`) y el resultado del job son los de AWS. Lo despacha el
+  mantenimiento diario de NanoFlow por el mismo
+  `.github/workflows/nanoflow-db.yml`.
+
+Los scripts `build` y `deploy` reciben `AZURE_TENANT_ID`,
+`AZURE_SUBSCRIPTION_ID`, `AZURE_CLIENT_ID`, `AZURE_RESOURCE_GROUP`,
+`AZURE_LOCATION` y `AZURE_REGISTRY`, con la CLI `az` ya dentro de la
+suscripción. El workflow renueva esa sesión justo antes del `deploy`: el token
+de GitHub con el que la CLI pide los suyos dura pocos minutos y un build largo
+lo dejaría vencido.
+
+Para un pipeline propio, la acción suelta:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+environment: development
+steps:
+  - uses: groupware-nanoflow/nanoflow-actions/actions/azure-credentials@v2
+    with:
+      api-url: https://devapi-nanoflow.groupware.com.co
+      audience: nanoflow-dev
+  - run: az containerapp list --resource-group "$AZURE_RESOURCE_GROUP" --output table
+```
+
+Deja además `$RUNNER_TEMP/nf-az-login.sh`, que repite el inicio de sesión
+cuando hace falta.
+
 ## Cosas que conviene saber
 
 - **Una hora.** Las credenciales son temporales y AWS limita a una hora la
@@ -192,9 +444,10 @@ credenciales: cada cuenta de ambiente confía directamente en el OIDC de GitHub
 
 | Workflow | Disparador | Rol | Qué hace |
 |---|---|---|---|
-| `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan; reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
-| `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado y `apply` de ese plan; despliegue informado con `report-deployment`. |
+| `terraform-plan.yml` | `pull_request` hacia la rama de un ambiente | `plan` (solo lectura + estado) | fmt, init, validate, tflint, trivy (HIGH/CRITICAL), plan (con los `moved` de `reconcile-moves`, ver abajo); reporte a NanoFlow (`report-plan` → `POST /v1/ci/plans`) y comentario en el PR, uno por ambiente, que se actualiza en cada push. |
+| `terraform-apply.yml` | `push` a la rama de un ambiente | `apply`, **solo** dentro del GitHub Environment del ambiente | plan guardado (con los `moved` de `reconcile-moves`; con colisiones no se aplica) y `apply` de ese plan; despliegue informado con `report-deployment`; si el apply sale bien, el output `nanoflow_contract` va a NanoFlow con `report-outputs` (`POST /v1/ci/infra-outputs`), que lo escribe como variables `NF_*` en los repos de aplicación. |
 | `terraform-drift.yml` | `workflow_dispatch` del `drift.yml` del repo, que despacha NanoFlow (nunca `schedule`) en la rama del ambiente | `plan`, dentro del GitHub Environment del ambiente | init y `plan -detailed-exitcode`; reporte a NanoFlow (`report-plan` con `has-changes`). Encontrar drift no falla el job; un plan que falla, sí. Sin fmt, tflint, trivy ni comentario. |
+| `terraform-destroy.yml` | `workflow_dispatch` del `destroy.yml` que pone NanoFlow, en la rama del ambiente | `plan` (modo `plan`) o `apply` (modo `destroy`), dentro del GitHub Environment | Destruye la infraestructura de un ambiente, en dos tiempos; ver [Destruir un ambiente](#destruir-un-ambiente-terraform-destroyyml). |
 
 El ambiente de cada rama, su directorio, su cuenta y sus roles están en
 `.nanoflow/infra.json`, que también genera NanoFlow (acción `infra-env`). El
@@ -214,7 +467,27 @@ jobs:
   el motivo.
 - trivy se descarga de su release y se verifica contra los checksums
   publicados; no se usan acciones de terceros para eso.
-- `report-plan` nunca falla el job: si NanoFlow no responde, deja un aviso.
+- **Credenciales de proveedores externos** (acción `provider-credentials`, doc 11
+  §18 y §19). Las carga el usuario en NanoFlow, que las sincroniza en el repo:
+  - **Auth0**, si el ambiente usa el provider `auth0/auth0`: dominio en la
+    variable de repo `NF_AUTH0_DOMAIN_<AMBIENTE>`, client M2M en los secretos
+    `AUTH0_CLIENT_ID`/`AUTH0_CLIENT_SECRET` del GitHub Environment. Un PR no ve
+    esos secretos: su plan corre con `-refresh=false`.
+  - **Supabase**, por cada `var.supabase["<base>"]`: proyecto en la variable de
+    repo `NF_SUPABASE_<AMBIENTE>_<BASE>` (`TF_VAR_supabase`) y contraseña en el
+    secreto `SUPABASE_DB_PASSWORD_<BASE>` del environment (variable efímera
+    `TF_VAR_supabase_passwords`, solo en apply, drift y destroy: la acción
+    recibe los secretos en JSON y toma solo esos nombres).
+  - **Cómo llegan los secretos del environment.** Un workflow reutilizable solo
+    ve los secretos que el llamador le pasa, y `secrets: inherit` no cruza
+    organizaciones (el repo de infra vive en la del cliente). Por eso
+    `apply.yml`, `drift.yml` y `destroy.yml` del repo pasan
+    `secrets: { NF_SECRETS: ${{ toJSON(secrets) }} }`: GitHub evalúa la
+    expresión en el job que declara el environment, así que lleva sus secretos.
+    Un repo generado antes de templates 0.20.1 no lo pasa y sus jobs no reciben
+    ningún secreto del ambiente (suficiente para Keycloak y Cognito; Auth0 y
+    Supabase necesitan reconstruir la infraestructura).
+- `report-plan` y `report-outputs` nunca fallan el job: si NanoFlow no responde, dejan un aviso. Un repo sin el output `nanoflow_contract` (templates < 0.6.0) se salta sin aviso de error.
 - `report-plan` acepta `has-changes` (`true`/`false`, el veredicto de
   `-detailed-exitcode`) y lo envía como `hasChanges`. NanoFlow solo lo usa si
   el token es de un `workflow_dispatch` de `.github/workflows/drift.yml`.
@@ -224,12 +497,161 @@ jobs:
   Con la tubería, un proceso hijo de Terraform que quedara vivo con la salida
   heredada impedía que el paso terminara aunque Terraform ya hubiera acabado.
 
-Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js`.
+- **Recursos que cambian de dirección con el mismo nombre físico** (acción
+  `reconcile-moves`, consola doc 32 §8.1). Si un módulo se renombra, o NanoFlow
+  reemplaza Terraform escrito a mano por el generado, el plan destruye la
+  dirección vieja y crea la nueva con el mismo nombre (`erp-…-dev-employees`), y
+  Terraform lo hace en paralelo: AWS rechaza la creación («EntityAlreadyExists»,
+  «ResourceAlreadyExistsException»). Tras el plan, `reconcile-moves` empareja
+  cada destrucción con la creación del mismo tipo e identidad física (por
+  ejemplo `role`+`policy_arn` de un attachment, `function_name` de una Lambda,
+  `name` del resto), escribe los pares 1:1 como bloques `moved` en
+  `nanoflow_moved.tf` (sin versionar) y se planea de nuevo. El plan y el
+  comentario del PR los listan («🔀 NanoFlow movió…»). Los grupos que no son
+  1:1 son colisiones: el check del plan falla y el apply no corre (el job sale
+  antes de tocar AWS con «El plan destruye y vuelve a crear recursos con el
+  mismo nombre físico…», que el clasificador de NanoFlow reconoce como
+  `TF_NAME_COLLISION`). Tras un apply, el estado ya tiene las direcciones
+  nuevas y el archivo deja de generarse.
+
+Tests: `node --test actions/report-plan/summarize.test.js actions/log-stream/log-stream.test.js actions/terraform-destroy/destroy.test.js actions/terraform-azure-destroy/destroy.test.js actions/reconcile-moves/reconcile.test.js actions/reconcile-moves/reconcile.azure.test.js`.
+
+### Repos de infra de Azure (`terraform-azure-*.yml`)
+
+Un proyecto de Azure (doc 40 de la consola, §18) usa tres workflows hermanos, que son los de arriba con dos piezas distintas. **Los de AWS no cambian**: son archivos aparte.
+
+| Workflow | Hermano de | Identidad |
+|---|---|---|
+| `terraform-azure-plan.yml` | `terraform-plan.yml` | `plan`: lee el grupo de recursos del ambiente y el estado |
+| `terraform-azure-apply.yml` | `terraform-apply.yml` | `apply`, **solo** dentro del GitHub Environment del ambiente |
+| `terraform-azure-drift.yml` | `terraform-drift.yml` | `plan`, dentro del GitHub Environment del ambiente |
+
+- **`azure-infra-env`** lee el `.nanoflow/infra.json` de Azure (`"provider": "azure"`): por ambiente, su suscripción, su directorio de Entra ID, su grupo de recursos y los ids de cliente de las identidades `plan` y `apply`. Valida cada valor antes de dejarlo salir y rechaza un archivo de AWS. Pruebas: `bash actions/azure-infra-env/resolve.test.sh`.
+- **`azure-oidc`** deja las variables `ARM_*` con las que el proveedor `azurerm` y su backend entran a Azure **con el token OIDC del job, sin secretos**. No hay credenciales que guardar ni que entregar: las identidades son administradas, viven en la suscripción del cliente, y su credencial federada decide qué rama o environment puede usarlas (`pull_request` para `plan`; `environment:<ambiente>` para `plan` y `apply`).
+
+Lo que falta respecto a AWS:
+
+- **Destruir un ambiente: `terraform-azure-destroy.yml`** (doc 40 de la consola, §21). Mismo contrato que
+  `terraform-destroy.yml` (lo despacha NanoFlow con `mode: plan | destroy`, pide autorización antes de entrar a Azure,
+  hasta tres intentos, informa el plan y el resultado), con la identidad `plan` para el plan y `apply` para el destroy.
+  No tiene preparación ni limpieza con la CLI de la nube: el blueprint de Azure no crea nada protegido contra borrado
+  ni fuera del estado. El inventario y el resultado salen de los JSON de Terraform (`actions/terraform-azure-destroy`,
+  que no llama a Azure) y avisan del borrado suave de Key Vault y API Management. `keep-snapshots` no tiene efecto.
+  Con un dominio propio en `azure_dns` (templates 0.29.0), el inventario lista la zona (`azure.dnsZones`, con sus
+  servidores de nombres) y avisa de que se borra con sus registros: la delegación del usuario deja de responder y una
+  zona nueva tiene otros servidores. El apply y el destroy dan `id-token: write` al job: el enlace del certificado de
+  Keycloak (`custom-domain.sh` del módulo `azure/identity/keycloak`) canjea el token OIDC del job.
+- **`reconcile-moves` conoce los tipos de Azure** (consola, doc 40 §22). Los recursos con nombre global (Key Vault, registro,
+  API Management, Static Web App, cuenta de almacenamiento) se emparejan por `name`, como cualquier tipo. Los que solo son
+  únicos dentro de su padre llevan su ámbito: asignaciones de rol (ámbito, rol y principal), secretos del Key Vault, APIs,
+  operaciones y políticas de API Management, Container Apps, identidades, colas y temas de Service Bus, contenedores de
+  blobs. Una asignación de rol cuyo principal solo se conoce tras el apply no se empareja. Desde la 0.29.0 de las
+  plantillas, también el dominio propio: la zona de Azure DNS (grupo de recursos y nombre), sus registros TXT, CNAME y A
+  (grupo, zona y nombre), el dominio y el certificado administrado de un Container App (app o entorno, y nombre) y el
+  dominio de una Static Web App (app y `domain_name`; no tiene `name`).
+- **No se han ejecutado contra Azure.** Son los workflows de AWS con esas dos piezas cambiadas; su primera ejecución real será la prueba.
+
+
+## Destruir un ambiente (`terraform-destroy.yml`)
+
+Doc 29 de la consola. El botón «Destruir» de Infraestructura borra **todo** lo
+que NanoFlow creó en un ambiente: los recursos de Terraform, lo que esos
+recursos dejan fuera del estado y, después (lo hace NanoFlow, no este
+workflow), el stack de bootstrap y el bucket de estado. NanoFlow pone en el repo
+un `destroy.yml` (un commit de la App con `[skip ci]` en la rama por defecto y en
+la del ambiente: `workflow_dispatch` exige el archivo en la rama por defecto) que
+solo llama a este workflow:
+
+| Input | |
+|---|---|
+| `api-url`, `audience` | Como en los demás. |
+| `environment` | Ambiente a destruir; debe ser el de la rama despachada (si no, el job falla antes de nada). |
+| `mode` | `plan` o `destroy`. |
+| `destroy-id` | Id de la destrucción en NanoFlow. |
+| `keep-snapshots` | Conservar un snapshot de cada base (`false` por defecto; la consola lo marca en producción). |
+
+**Autorización.** El primer paso, antes de pedir credenciales de AWS, es
+`report-destroy` en fase `start` (`POST /v1/ci/infra-destroys`): NanoFlow
+responde 200 con `authorized: true` solo si hay una destrucción en el estado de
+ese modo (plan pedido o destrucción confirmada) para este repo, rama, ambiente,
+id y `keep-snapshots`, y fija el run. Un `workflow_dispatch` lanzado a mano
+desde GitHub no destruye nada.
+
+**`mode: plan`** (rol de plan, solo lectura): `terraform plan -destroy` y
+`destroy.js inventory`, que cuenta lo que tiene datos (bases y sus snapshots
+manuales, objetos de los buckets, ítems de DynamoDB, usuarios de Cognito,
+connections de Auth0, registros DNS que no son de Terraform, secretos,
+distribuciones, llaves KMS, log groups implícitos y las bases de Supabase, que
+no se tocan). A NanoFlow va `{summary, inventory}` (fase `plan`); los JSON del
+plan y del estado, que traen valores sensibles, se quedan en el runner. Su grupo
+de concurrencia es propio: un apply que llega después no lo cancela.
+
+**`mode: destroy`** (rol de apply, mismo grupo de concurrencia que el apply):
+
+1. `destroy.js prepare` sobre el estado: vacía los buckets (versiones y marcas),
+   quita la protección de borrado de RDS, Aurora, DynamoDB y Cognito, y borra las
+   bases con la CLI (`--skip-final-snapshot --delete-automated-backups`): el
+   snapshot final de las plantillas tiene un nombre fijo y en producción depende
+   del ambiente. Con `keep-snapshots`, antes crea `<base>-nanoflow-<yyyymmddhhmm>`
+   (RDS/Aurora) o un backup bajo demanda (DynamoDB), conserva los snapshots de
+   pre-migración y saca del estado la llave KMS que los cifra (si Terraform la
+   programara para borrarse, quedarían inservibles; el alias sí se borra). Borra
+   también los registros de la zona que no son de Terraform (no el SOA ni el NS
+   del apex). Si algo de esto falla, no se corre Terraform.
+2. Hasta 3 intentos de `plan -destroy` + `apply`, cada uno con credenciales
+   nuevas (la sesión del rol dura 1 h) y 2 min de espera entre intentos (ENIs de
+   las Lambdas en VPC, origen VPC de CloudFront). Cada intento, 55 min como máximo.
+3. `destroy.js cleanup`, solo sobre lo que ya salió del estado: borra sin
+   recuperación los secretos (libera los nombres para recrear), los log groups
+   que AWS crea solo (`/aws/rds/instance|cluster/<id>/postgresql`,
+   `/aws/rds/proxy/<nombre>`, Container Insights del clúster ECS) y, sin
+   `keep-snapshots`, los snapshots de pre-migración (`<base>-pre-*`).
+4. `terraform state list` → restantes; `report-destroy` en fase `destroy` con
+   `status`, el resultado (`remaining`, `destroyed`, `attempts`, `snapshots`,
+   `retained`, `cleaned`, `warnings`) y, si falló, `error.code`
+   (`STATE_UNREADABLE`, `PREPARE_FAILED`, `TERRAFORM_DESTROY_FAILED`,
+   `RESOURCES_REMAIN`). El job termina en rojo si queda algo.
+
+**La guarda.** Al confirmar, NanoFlow crea la variable de repo
+`NF_INFRA_DESTROYED_<AMBIENTE>` (`DEVELOPMENT`, `STAGING`, `PRODUCTION`; el
+valor es el id de la destrucción). Mientras exista, `terraform-apply.yml` no
+aplica ese ambiente (el job `apply` no corre y, si la variable apareció mientras
+esperaba la concurrencia, su primer paso falla), y `terraform-plan.yml` y
+`terraform-drift.yml` lo saltan con un aviso (acción `infra-destroyed`). NanoFlow
+la borra al volver a construir la infraestructura.
+
+**Lo que este workflow no borra:** snapshots y backups pedidos, sus llaves KMS,
+snapshots manuales hechos a mano (sin `keep-snapshots` quedan sin llave: se
+avisa), los datos de Supabase, el bootstrap y el bucket de estado (los borra
+NanoFlow después), la cuenta AWS y el clúster de ejecución.
 
 ## Versionado
 
 Los repos de los clientes apuntan a `@v1`, una etiqueta móvil sobre la última
 versión compatible. Un cambio que rompa el contrato sale como una etiqueta
 nueva y los repos se migran cuando toque, no a la fuerza. `@v2` agrega los
-workflows de Terraform y las acciones `report-plan` e `infra-env`; `deploy-aws.yml`
-y las acciones de `@v1` no cambian.
+workflows de Terraform y las acciones `report-plan`, `report-outputs` e
+`infra-env`. `deploy-aws.yml` agregó el input opcional `environment` y la clave
+`env-map` sin romper a quien no los usa, así que siguió en `@v1`; lo mismo
+la clave `databases` (paso «Migraciones», acción `db-migrate`) y los workflows
+`db-check.yml` y `db-drift.yml`. Los workflows `terraform-azure-*.yml` y las
+acciones `azure-infra-env` y `azure-oidc` son archivos nuevos: mover `@v2` para
+incluirlos no cambia ningún archivo que use un repo de AWS. Lo mismo
+`deploy-azure.yml` y la acción `azure-credentials`: los repos de aplicación de
+un proyecto en Azure apuntan a `@v2`; los de AWS siguen en `@v1` con
+`deploy-aws.yml`, que no cambió. La acción `db-migrate` ganó una rama para
+los secretos de Supabase en Key Vault (un `NF_DB_<NOMBRE>_MIGRATOR` que es la
+URL de un secreto de Key Vault): es solo código añadido, y un ARN de Secrets
+Manager o el nombre de una Lambda siguen el camino de siempre. `db-drift-azure.yml`
+es un archivo nuevo que usa esa misma rama en modo `drift`: `db-drift.yml` y
+`migrate.sh` no cambiaron, y mover `@v2` para incluirlo no toca nada de lo que
+usa un repo de AWS. La rama de PostgreSQL flexible (una URL de cola
+`*.queue.core.windows.net/migrate`) también es solo código añadido en
+`migrate.sh` (un `elif` antes del de la Lambda y otro antes del snapshot de
+RDS); las líneas de AWS y de Supabase no cambian.
+
+Pruebas de los scripts de shell (sin red ni nube):
+`bash actions/azure-infra-env/resolve.test.sh`,
+`bash actions/db-migrate/migrate.azure-drift.test.sh` y
+`bash actions/db-migrate/migrate.azure-queue.test.sh` (PostgreSQL flexible:
+la cola del job migrador).

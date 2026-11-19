@@ -1,0 +1,281 @@
+# mobile-ui-tests.yml — pruebas de UI de una app nativa con Maestro (doc 42 §16.1
+# de la consola de NanoFlow).
+#
+# Lo llama .github/workflows/nanoflow-ui-tests.yml, que NanoFlow agrega al
+# conectar un repositorio android o ios. Compila el debug de development, lo
+# instala en un emulador (Android, ubuntu-latest con KVM) o en un simulador
+# (iOS, macos-latest) y corre los flujos de .maestro/ contra development real:
+# el API desplegado y el usuario de prueba de development.
+#
+# La configuración y el usuario de prueba los entrega NanoFlow
+# (POST /v1/ci/mobile-test-session) solo a ESTE workflow: el endpoint exige que
+# job_workflow_ref del token OIDC sea este archivo. La contraseña se enmascara
+# y solo llega a Maestro; nunca va al artifact.
+#
+# El artifact nanoflow-ui-tests-<plataforma> es la evidencia del evaluador:
+# result.json (status passed | failed | no-flows | setup-failed y un mensaje),
+# report.xml (JUnit: un caso por flujo, .maestro/<idDelCriterio>.yaml) y las
+# capturas.
+name: mobile-ui-tests
+
+on:
+  workflow_call:
+    inputs:
+      api-url:
+        description: Base del API de NanoFlow.
+        type: string
+        required: true
+      audience:
+        description: Audiencia OIDC, p. ej. nanoflow-dev.
+        type: string
+        required: true
+      platform:
+        description: android | ios.
+        type: string
+        required: true
+      xcode-project:
+        description: iOS — el proyecto de Xcode de la raíz, sin .xcodeproj (su esquema compartido tiene el mismo nombre).
+        type: string
+        default: ""
+      xcode-workspace:
+        description: iOS — compilar <xcode-project>.xcworkspace en lugar del proyecto.
+        type: boolean
+        default: false
+      android-api-level:
+        description: Android — nivel de API del emulador.
+        type: number
+        default: 34
+      maestro-version:
+        description: Versión de la CLI de Maestro.
+        type: string
+        default: "1.40.0"
+      flows:
+        description: Carpeta de los flujos.
+        type: string
+        default: .maestro
+
+jobs:
+  ui-tests:
+    runs-on: ${{ inputs.platform == 'ios' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NF_FLOWS: ${{ inputs.flows }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar la salida
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.platform }}' in
+            android|ios) ;;
+            *) echo "::error::platform debe ser android o ios."; exit 1 ;;
+          esac
+          # Fuera del checkout: nada de la salida se confunde con el repositorio.
+          NF_OUT="$RUNNER_TEMP/nanoflow-ui-tests"
+          echo "NF_OUT=$NF_OUT" >> "$GITHUB_ENV"
+          mkdir -p "$NF_OUT/screenshots"
+          # result.json lo reescribe cada paso que decide algo; si el job se
+          # corta antes, el evaluador ve setup-failed con este mensaje.
+          jq -n '{status: "setup-failed", message: "El job terminó antes de correr los flujos: mira el log de la corrida."}' > "$NF_OUT/result.json"
+
+      - name: ¿Hay flujos?
+        id: flows
+        shell: bash
+        run: |
+          set -euo pipefail
+          count=$(find "$NF_FLOWS" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | wc -l | tr -d ' ')
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          if [ "$count" = "0" ]; then
+            jq -n --arg dir "$NF_FLOWS" '{status: "no-flows", message: ("El repositorio no tiene flujos de Maestro en " + $dir + "/ (uno por criterio: <idDelCriterio>.yaml).")}' > "$NF_OUT/result.json"
+            echo "::notice::No hay flujos de Maestro en ${NF_FLOWS}/: no hay nada que probar."
+          else
+            echo "${count} flujos en ${NF_FLOWS}/."
+          fi
+
+      - name: Sesión de prueba de development
+        if: steps.flows.outputs.count != '0'
+        shell: bash
+        env:
+          NF_API: ${{ inputs.api-url }}
+          NF_AUDIENCE: ${{ inputs.audience }}
+        run: |
+          set -euo pipefail
+          setup_failed() {
+            jq -n --arg m "$1" '{status: "setup-failed", message: $m}' > "$NF_OUT/result.json"
+            echo "::error::$1"
+            exit 1
+          }
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            setup_failed "Este job no tiene 'permissions: id-token: write', así que no puede pedir su token OIDC."
+          fi
+          oidc=$(curl -sS --fail-with-body -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value')
+          if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+            setup_failed "GitHub no devolvió un token OIDC para la audiencia ${NF_AUDIENCE}."
+          fi
+          body=$(mktemp)
+          trap 'rm -f "$body"' EXIT
+          code=$(curl -sS -o "$body" -w '%{http_code}' -X POST "${NF_API%/}/v1/ci/mobile-test-session" \
+            -H "Authorization: Bearer ${oidc}" -H 'Accept: application/json')
+          if [ "$code" != "200" ]; then
+            setup_failed "NanoFlow no entregó la sesión de prueba (HTTP ${code}): $(jq -r '.message // "sin detalle"' "$body" 2>/dev/null || echo 'sin detalle')"
+          fi
+          # La contraseña llega por HTTP: GitHub no la conoce. Se enmascara antes
+          # de que cualquier otro comando la pueda imprimir.
+          echo "::add-mask::$(jq -r '.testUser.password' "$body")"
+          {
+            echo "NF_APP_ID=$(jq -r '.appId' "$body")"
+            echo "NF_TEST_USERNAME=$(jq -r '.testUser.username' "$body")"
+            echo "NF_TEST_PASSWORD=$(jq -r '.testUser.password' "$body")"
+            # Las NF_* de development de la app: las lee el build (Gradle o el .xcconfig).
+            jq -r '.variables | to_entries[] | select(.key | test("^NF_[A-Z0-9_]+$")) | "\(.key)=\(.value)"' "$body"
+          } >> "$GITHUB_ENV"
+          echo "Development · app $(jq -r '.appId' "$body") · usuario de prueba $(jq -r '.testUser.username' "$body")"
+
+      - name: Java
+        if: steps.flows.outputs.count != '0'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Maestro
+        if: steps.flows.outputs.count != '0'
+        shell: bash
+        env:
+          MAESTRO_VERSION: ${{ inputs.maestro-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+      # ---------------------------------------------------------------- Android
+      - name: Compilar el debug de development (Android)
+        if: steps.flows.outputs.count != '0' && inputs.platform == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          if ! ./gradlew --no-daemon assembleDevelopmentDebug; then
+            jq -n '{status: "setup-failed", message: "No compiló el debug del flavor development (./gradlew assembleDevelopmentDebug): mira el log."}' > "$NF_OUT/result.json"
+            exit 1
+          fi
+          apk=$(ls app/build/outputs/apk/development/debug/*.apk 2>/dev/null | head -n 1)
+          if [ -z "$apk" ]; then
+            jq -n '{status: "setup-failed", message: "El build no dejó el APK en app/build/outputs/apk/development/debug/."}' > "$NF_OUT/result.json"
+            exit 1
+          fi
+          echo "NF_APK=$(pwd)/$apk" >> "$GITHUB_ENV"
+
+      - name: KVM para el emulador
+        if: steps.flows.outputs.count != '0' && inputs.platform == 'android'
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Guion de las pruebas
+        if: steps.flows.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Un solo guion para las dos plataformas: el emulador de Android corre
+          # cada línea de su script por separado, así que se le pasa este archivo.
+          cat > "$RUNNER_TEMP/nf-maestro.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          flows="$(pwd)/${NF_FLOWS}"
+          cd "$NF_OUT/screenshots"
+          maestro test "$flows" --format junit --output "$NF_OUT/report.xml" --debug-output "$NF_OUT/debug" \
+            -e NF_APP_ID="$NF_APP_ID" -e NF_TEST_USERNAME="$NF_TEST_USERNAME" -e NF_TEST_PASSWORD="$NF_TEST_PASSWORD"
+          rc=$?
+          if [ "$rc" = "0" ]; then
+            jq -n '{status: "passed", message: "Todos los flujos pasaron."}' > "$NF_OUT/result.json"
+          else
+            jq -n --arg rc "$rc" '{status: "failed", message: ("Maestro terminó con código " + $rc + ": report.xml dice qué flujos fallaron.")}' > "$NF_OUT/result.json"
+          fi
+          exit "$rc"
+          SH
+          chmod +x "$RUNNER_TEMP/nf-maestro.sh"
+
+      - name: Pruebas en el emulador (Android)
+        if: steps.flows.outputs.count != '0' && inputs.platform == 'android'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.android-api-level }}
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: adb install -r "$NF_APK" && "$RUNNER_TEMP/nf-maestro.sh"
+
+      # -------------------------------------------------------------------- iOS
+      - name: Compilar el debug de development (iOS)
+        if: steps.flows.outputs.count != '0' && inputs.platform == 'ios'
+        shell: bash
+        env:
+          NF_XCODE_PROJECT: ${{ inputs.xcode-project }}
+          NF_XCODE_WORKSPACE: ${{ inputs.xcode-workspace }}
+        run: |
+          set -euo pipefail
+          fail() { jq -n --arg m "$1" '{status: "setup-failed", message: $m}' > "$NF_OUT/result.json"; echo "::error::$1"; exit 1; }
+          [ -n "$NF_XCODE_PROJECT" ] || fail "Falta xcode-project: vuelve a conectar el repositorio desde NanoFlow."
+          xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i -E 'beta|release.candidate|_rc' | sort -V | tail -n 1 || true)
+          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode/Contents/Developer"; fi
+          xcodebuild -version
+          # La configuración de development; en un .xcconfig, // empieza un comentario.
+          mkdir -p Config
+          xc() { printf '%s = %s\n' "$1" "$(printf '%s' "${!1:-}" | sed 's#//#/$()/#g')"; }
+          {
+            echo "// Generado por NanoFlow para las pruebas de UI: no lo edites ni lo versiones."
+            for v in $(compgen -e | grep -E '^NF_' | grep -v -E '^NF_(TEST_|OUT$|FLOWS$|XCODE_)'); do xc "$v"; done
+          } > Config/NanoFlow.xcconfig
+          source=(-project "${NF_XCODE_PROJECT}.xcodeproj")
+          if [ "$NF_XCODE_WORKSPACE" = "true" ]; then source=(-workspace "${NF_XCODE_PROJECT}.xcworkspace"); fi
+          if ! xcodebuild build "${source[@]}" -scheme "$NF_XCODE_PROJECT" -configuration Debug \
+              -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+              -derivedDataPath "$RUNNER_TEMP/dd" CODE_SIGNING_ALLOWED=NO; then
+            fail "No compiló el esquema ${NF_XCODE_PROJECT} para el simulador: mira el log."
+          fi
+          app=$(ls -d "$RUNNER_TEMP"/dd/Build/Products/Debug-iphonesimulator/*.app 2>/dev/null | head -n 1)
+          [ -n "$app" ] || fail "El build no dejó la app en Build/Products/Debug-iphonesimulator/."
+          udid=$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | test("^iPhone"))] | last | .udid // empty')
+          [ -n "$udid" ] || fail "La imagen de macOS no tiene un simulador de iPhone disponible."
+          xcrun simctl boot "$udid" || true
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl install "$udid" "$app"
+          echo "Simulador $(xcrun simctl list devices -j | jq -r --arg u "$udid" '.devices[][] | select(.udid == $u) | .name') con la app instalada."
+
+      - name: Pruebas en el simulador (iOS)
+        if: steps.flows.outputs.count != '0' && inputs.platform == 'ios'
+        shell: bash
+        run: '"$RUNNER_TEMP/nf-maestro.sh"'
+
+      # ------------------------------------------------------------- Evidencia
+      - name: Resumen
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Pruebas de UI (${{ inputs.platform }})"
+            echo
+            echo "**$(jq -r '.status' "$NF_OUT/result.json" 2>/dev/null || echo 'setup-failed')** — $(jq -r '.message' "$NF_OUT/result.json" 2>/dev/null || echo 'sin result.json')"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Nada del usuario de prueba sale en el artifact: se revisa por si un
+          # flujo lo imprimió en un log de depuración.
+          if [ -n "${NF_TEST_PASSWORD:-}" ]; then
+            grep -rlF -- "$NF_TEST_PASSWORD" "$NF_OUT" 2>/dev/null | while read -r f; do rm -f "$f"; echo "::warning::Se quitó ${f#$NF_OUT/} del artifact: contenía la contraseña del usuario de prueba."; done
+          fi
+
+      - name: Artifact de evidencia
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanoflow-ui-tests-${{ inputs.platform }}
+          path: ${{ env.NF_OUT }}
+          retention-days: 14
+          if-no-files-found: warn

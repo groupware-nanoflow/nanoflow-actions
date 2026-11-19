@@ -36,10 +36,30 @@ on:
         required: false
         type: boolean
         default: true
+      environment:
+        description: >
+          GitHub Environment del ambiente de esta rama (development, staging,
+          production). Con él, el job ve las variables NF_* que NanoFlow escribe
+          ahí (el contrato de plataforma: URL del API, issuer OIDC…) y las
+          exporta a build y deploy. NanoFlow comprueba que sea el de la rama.
+          Vacío: sin GitHub Environment, como antes.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      NF_SECRETS:
+        description: >
+          Los secretos del job que llama, en JSON (`toJSON(secrets)`): un
+          workflow reutilizable solo ve los que se le pasan. Al build y al
+          deploy llegan únicamente los nombres que el manifiesto lista en
+          `secret-env` (p. ej. el keystore de una app Android, doc 42 de la
+          consola), enmascarados. Sin él, como antes.
+        required: false
 
 jobs:
   deploy:
     runs-on: ${{ inputs.runs-on }}
+    environment: ${{ inputs.environment }}
     permissions:
       # Lo mínimo: leer el código y poder pedir el token OIDC. En particular NO
       # se pide `contents: write`: un despliegue no reescribe el repositorio.
@@ -70,6 +90,7 @@ jobs:
             echo "node=$(yq -r '.toolchain.node // ""' "$MANIFEST")"
             echo "go=$(yq -r '.toolchain.go // ""' "$MANIFEST")"
             echo "python=$(yq -r '.toolchain.python // ""' "$MANIFEST")"
+            echo "java=$(yq -r '.toolchain.java // ""' "$MANIFEST")"
           } >> "$GITHUB_OUTPUT"
 
       - name: Credenciales del ambiente
@@ -117,6 +138,63 @@ jobs:
             echo "mask-env=${mask_env}"
           } >> "$GITHUB_OUTPUT"
 
+      # El contrato de plataforma del ambiente (doc 11 §11 de la consola): las
+      # variables NF_* del GitHub Environment pasan al entorno de build y deploy,
+      # y el manifiesto puede darles otro nombre con env-map (p. ej.
+      # VITE_API_URL: NF_API_URL) en la raíz o por ambiente. Solo se imprimen
+      # nombres. Sin `environment` no hay variables NF_* y el paso no hace nada.
+      - name: Contrato de plataforma
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          ENVIRONMENT: ${{ steps.aws.outputs.environment }}
+          DECLARED: ${{ inputs.environment }}
+          VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DECLARED" ] && [ "$DECLARED" != "$ENVIRONMENT" ]; then
+            echo "::error::El workflow declara el GitHub Environment ${DECLARED}, pero NanoFlow resolvió ${ENVIRONMENT} para esta rama."
+            exit 1
+          fi
+          # name=value en una línea cada uno; un valor con salto de línea se
+          # escribe con delimitador.
+          export_var() {
+            local name="$1" value="$2" delim
+            if [[ "$value" == *$'\n'* ]]; then
+              delim="__NF_$(openssl rand -hex 8)__"
+              { echo "${name}<<${delim}"; echo "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+            else
+              echo "${name}=${value}" >> "$GITHUB_ENV"
+            fi
+          }
+          # Solo las NF_* con valor string: el contrato.
+          contract=$(jq -c 'with_entries(select((.key | test("^NF_[A-Z0-9_]+$")) and (.value | type == "string")))' <<< "$VARS_JSON")
+          if [ "$(jq 'length' <<< "$contract")" -eq 0 ]; then
+            echo "Sin variables NF_* en este job (sin GitHub Environment o NanoFlow aún no las escribió)."
+            exit 0
+          fi
+          while IFS= read -r name; do
+            export_var "$name" "$(jq -r --arg n "$name" '.[$n]' <<< "$contract")"
+          done < <(jq -r 'keys[]' <<< "$contract")
+          echo "Contrato de plataforma: $(jq -r 'keys | join(" ")' <<< "$contract")"
+          # env-map: DESTINO: NF_ORIGEN. Lo del ambiente gana sobre la raíz.
+          mapped=$(yq -o=json '(.["env-map"] // {}) * (.environments.'"${ENVIRONMENT}"'["env-map"] // {})' "$MANIFEST")
+          while IFS=$'\t' read -r target source; do
+            [ -n "$target" ] || continue
+            if ! [[ "$target" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || [[ "$target" =~ ^(AWS_|GITHUB_|ACTIONS_|RUNNER_|NF_) ]]; then
+              echo "::warning::env-map: '${target}' no es un nombre válido o es reservado; se ignora."
+              continue
+            fi
+            if [ "$(jq --arg n "$source" 'has($n)' <<< "$contract")" != true ]; then
+              # Normal: el env-map generado lista también las claves OIDC, que
+              # solo existen con un proveedor de identidad.
+              echo "  ${target}: ${source} no está en el contrato de este ambiente; se omite."
+              continue
+            fi
+            export_var "$target" "$(jq -r --arg n "$source" '.[$n]' <<< "$contract")"
+            echo "  ${target} ← ${source}"
+          done < <(jq -r 'to_entries[] | [.key, (.value | tostring)] | @tsv' <<< "$mapped")
+
       # El log en vivo: GitHub no expone el de un job mientras corre, así que
       # build y deploy pasan su salida por log-stream, que la sigue imprimiendo
       # aquí y la reenvía a NanoFlow. Con live-logs: false queda en solo-eco.
@@ -150,6 +228,54 @@ jobs:
         if: steps.manifest.outputs.python != ''
         with:
           python-version: ${{ steps.manifest.outputs.python }}
+
+      # Una app Android (doc 42 de la consola): el JDK del manifiesto; el SDK de
+      # Android ya viene en ubuntu-latest (ANDROID_HOME).
+      - uses: actions/setup-java@v4
+        if: steps.manifest.outputs.java != ''
+        with:
+          distribution: temurin
+          java-version: ${{ steps.manifest.outputs.java }}
+          cache: gradle
+
+      # Los secretos que el manifiesto pide (`secret-env`, p. ej.
+      # NF_ANDROID_KEYSTORE): solo esos nombres, desde NF_SECRETS, enmascarados.
+      # Sin `secret-env` o sin NF_SECRETS no hace nada.
+      - name: Secretos del build
+        shell: bash
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+          NF_SECRETS: ${{ secrets.NF_SECRETS }}
+        run: |
+          set -euo pipefail
+          names=$(
+            case "$(yq -r '.["secret-env"] | tag' "$MANIFEST")" in
+              '!!seq') yq -r '.["secret-env"][]' "$MANIFEST" ;;
+              '!!str') yq -r '.["secret-env"]' "$MANIFEST" | tr ', ' '\n\n' ;;
+            esac | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u || true
+          )
+          [ -n "$names" ] || exit 0
+          if [ -z "${NF_SECRETS:-}" ]; then
+            echo "::warning::El manifiesto pide secretos (secret-env) pero el workflow del repositorio no pasa NF_SECRETS: vuelve a conectar el repositorio desde NanoFlow."
+            exit 0
+          fi
+          while IFS= read -r name; do
+            if [[ "$name" =~ ^(AWS_|GITHUB_|ACTIONS_|RUNNER_) ]]; then
+              echo "::warning::secret-env: '${name}' es reservado; se ignora."
+              continue
+            fi
+            if [ "$(jq --arg n "$name" 'has($n)' <<< "$NF_SECRETS")" != true ]; then
+              echo "::warning::secret-env: el secreto ${name} no existe en el repositorio ni en su environment."
+              continue
+            fi
+            value=$(jq -r --arg n "$name" '.[$n]' <<< "$NF_SECRETS")
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::add-mask::${line}"
+            done <<< "$value"
+            delim="__NF_$(openssl rand -hex 8)__"
+            { echo "${name}<<${delim}"; echo "$value"; echo "$delim"; } >> "$GITHUB_ENV"
+            echo "  ${name} (secreto)"
+          done <<< "$names"
 
       # Los comandos del manifiesto se pasan por variable de entorno y se
       # ejecutan desde un archivo, no interpolados dentro del `run`. Interpolar
@@ -257,6 +383,23 @@ jobs:
           echo "exit-code=${rc}" >> "$GITHUB_OUTPUT"
           exit "$rc"
 
+      # Migraciones antes del código (doc 11 §14 de la consola): si el
+      # manifiesto declara `databases`, cada base se migra con su Lambda
+      # migradora (bootstrap, snapshot si hay contract/destructive fuera de
+      # development, apply) y se informa a NanoFlow. Si falla, no hay deploy:
+      # todo lo que llega es expand/migrate, así que el código anterior sigue
+      # funcionando con el esquema que quedó. Sin `databases` no hace nada.
+      - name: Migraciones
+        id: migrate
+        # Incluye la espera del snapshot previo a un lote contract/destructive.
+        timeout-minutes: 75
+        uses: groupware-nanoflow/nanoflow-actions/actions/db-migrate@v1
+        with:
+          api-url: ${{ inputs.api-url }}
+          audience: ${{ inputs.audience }}
+          manifest: ${{ inputs.manifest }}
+          environment: ${{ steps.aws.outputs.environment }}
+
       - name: Deploy
         id: deploy
         timeout-minutes: 30
@@ -285,6 +428,8 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           BUILD_EXIT: ${{ steps.build.outputs.exit-code }}
+          MIGRATE_OUTCOME: ${{ steps.migrate.outcome }}
+          MIGRATE_ERROR: ${{ steps.migrate.outputs.error }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           DEPLOY_EXIT: ${{ steps.deploy.outputs.exit-code }}
           URL: ${{ steps.commands.outputs.url }}
@@ -298,6 +443,8 @@ jobs:
           if [ "$status" = "failure" ]; then
             if [ "$BUILD_OUTCOME" = "failure" ]; then
               error="build: exit ${BUILD_EXIT:-?}"
+            elif [ "$MIGRATE_OUTCOME" = "failure" ]; then
+              error="migrate: ${MIGRATE_ERROR:-falló}"
             elif [ "$DEPLOY_OUTCOME" = "failure" ]; then
               error="deploy: exit ${DEPLOY_EXIT:-?}"
             else

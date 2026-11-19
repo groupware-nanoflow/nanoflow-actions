@@ -1,0 +1,90 @@
+name: NanoFlow report outputs
+description: >
+  Envía a NanoFlow el contrato de plataforma del ambiente (el output
+  nanoflow_contract de Terraform: URL del API, issuer OIDC…) después de un
+  apply. NanoFlow lo entrega a los repos de aplicación como variables NF_* de su
+  GitHub Environment. El ambiente no se manda: sale de la rama firmada en el
+  token OIDC. Nunca falla el job.
+
+inputs:
+  api-url:
+    description: Base del API de NanoFlow, p. ej. https://devapi-nanoflow.groupware.com.co
+    required: true
+  audience:
+    description: Audiencia que se le pide a GitHub, p. ej. nanoflow-dev.
+    required: true
+  working-directory:
+    description: Directorio del ambiente de Terraform ya aplicado (envs/<ambiente>).
+    required: true
+
+outputs:
+  changed:
+    description: "true si el contrato cambió y NanoFlow va a actualizar los repos de aplicación"
+    value: ${{ steps.report.outputs.changed }}
+
+runs:
+  using: composite
+  steps:
+    - id: report
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        NF_API_URL: ${{ inputs.api-url }}
+        NF_AUDIENCE: ${{ inputs.audience }}
+      run: |
+        # Sin `set -e` a propósito: este paso informa, no decide.
+        set -uo pipefail
+
+        report() {
+          local contract oidc body code payload
+          # Un repo generado con templates < 0.6.0 no tiene el output: no es un
+          # error, simplemente no hay contrato que enviar.
+          if ! contract=$(terraform output -json nanoflow_contract 2>/dev/null </dev/null); then
+            echo "SKIP: el repo no declara el output nanoflow_contract (regenéralo desde NanoFlow para tenerlo)."
+            return 0
+          fi
+          if ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$contract"; then
+            echo "el output nanoflow_contract no es un objeto"
+            return 1
+          fi
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "el job no tiene 'permissions: id-token: write'"
+            return 1
+          fi
+          oidc=$(curl -sS --fail --max-time 10 --retry 2 --retry-connrefused \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value') || true
+          if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+            echo "GitHub no devolvió un token OIDC para la audiencia ${NF_AUDIENCE}"
+            return 1
+          fi
+          payload=$(jq -c '{contract: .}' <<< "$contract") || { echo "no se pudo armar el cuerpo"; return 1; }
+
+          body=$(mktemp)
+          code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 15 --retry 2 --retry-connrefused \
+            -X POST "${NF_API_URL%/}/v1/ci/infra-outputs" \
+            -H "Authorization: Bearer ${oidc}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json' \
+            --data "$payload") || code="000"
+          if [ "$code" = "000" ]; then
+            echo "NanoFlow no respondió"
+            rm -f "$body"
+            return 1
+          fi
+          if [ "$code" != "200" ]; then
+            echo "HTTP ${code}: $(jq -r '.message // "sin detalle"' "$body" 2>/dev/null || echo 'sin detalle')"
+            rm -f "$body"
+            return 1
+          fi
+          echo "changed=$(jq -r '.changed // false' "$body")" >> "$GITHUB_OUTPUT"
+          echo "NanoFlow: contrato de $(jq -r '.environment' "$body") con $(jq -r '.keys' "$body") claves ($(jq -r 'if .stale then "reporte más viejo que el guardado: ignorado" elif .changed then "cambió: se actualizan los repos de aplicación" else "sin cambios" end' "$body"))."
+          rm -f "$body"
+        }
+
+        if ! msg=$(report 2>&1); then
+          echo "::warning::NanoFlow no registró el contrato de plataforma: ${msg##*$'\n'}"
+        else
+          echo "$msg"
+        fi
+        exit 0

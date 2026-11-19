@@ -1,0 +1,149 @@
+name: NanoFlow report destroy
+description: >
+  Habla con NanoFlow durante una destrucción (POST /v1/ci/infra-destroys, doc 29
+  de la consola) con el token OIDC del job. Fase `start`: pregunta si hay una
+  destrucción confirmada (o un plan pedido) para este repo, rama, ambiente, modo
+  e id; sin un 200 con authorized = true el paso falla y el job no toca AWS (un
+  workflow_dispatch manual desde GitHub no destruye nada). Fases `plan` y
+  `destroy`: informan el plan con su inventario o el resultado; fallan si
+  NanoFlow no lo registra.
+
+inputs:
+  api-url:
+    description: Base del API de NanoFlow, p. ej. https://devapi-nanoflow.groupware.com.co
+    required: true
+  audience:
+    description: Audiencia OIDC, p. ej. nanoflow-dev.
+    required: true
+  destroy-id:
+    description: Id de la destrucción en NanoFlow.
+    required: true
+  phase:
+    description: start | plan | destroy
+    required: true
+  mode:
+    description: plan | destroy (el del workflow_dispatch).
+    required: true
+  environment:
+    description: Ambiente (NanoFlow lo verifica contra la rama firmada en el token).
+    required: true
+  keep-snapshots:
+    description: "'true' | 'false', el input del workflow_dispatch (NanoFlow lo compara con lo confirmado)."
+    required: false
+    default: 'false'
+  status:
+    description: succeeded | failed (fases plan y destroy).
+    required: false
+    default: ''
+  plan-file:
+    description: JSON {summary, inventory} de destroy.js inventory (fase plan).
+    required: false
+    default: ''
+  result-file:
+    description: JSON del resultado de destroy.js result (fase destroy).
+    required: false
+    default: ''
+  error-code:
+    required: false
+    default: ''
+  error-message:
+    required: false
+    default: ''
+
+outputs:
+  authorized:
+    description: "'true' si NanoFlow autorizó el run (fase start)"
+    value: ${{ steps.report.outputs.authorized }}
+
+runs:
+  using: composite
+  steps:
+    - id: report
+      shell: bash
+      env:
+        NF_API_URL: ${{ inputs.api-url }}
+        NF_AUDIENCE: ${{ inputs.audience }}
+        NF_ID: ${{ inputs.destroy-id }}
+        NF_PHASE: ${{ inputs.phase }}
+        NF_MODE: ${{ inputs.mode }}
+        NF_ENV: ${{ inputs.environment }}
+        NF_KEEP: ${{ inputs.keep-snapshots }}
+        NF_STATUS: ${{ inputs.status }}
+        NF_PLAN_FILE: ${{ inputs.plan-file }}
+        NF_RESULT_FILE: ${{ inputs.result-file }}
+        NF_ERROR_CODE: ${{ inputs.error-code }}
+        NF_ERROR_MESSAGE: ${{ inputs.error-message }}
+      run: |
+        set -uo pipefail
+        echo "authorized=false" >> "$GITHUB_OUTPUT"
+        what() { case "$NF_PHASE" in start) echo "la autorización" ;; plan) echo "el plan de destrucción" ;; *) echo "el resultado de la destrucción" ;; esac; }
+        die() {
+          if [ "$NF_PHASE" = start ]; then
+            echo "::error::NanoFlow no autorizó la destrucción de ${NF_ENV} (${1}). Este run no toca nada: las destrucciones se lanzan desde NanoFlow (Infraestructura → «Destruir»)."
+          else
+            echo "::error::NanoFlow no registró $(what) de ${NF_ENV}: ${1}"
+          fi
+          exit 1
+        }
+
+        case "$NF_PHASE" in start|plan|destroy) ;; *) die "fase desconocida '${NF_PHASE}'" ;; esac
+        case "$NF_MODE" in plan|destroy) ;; *) die "modo desconocido '${NF_MODE}'" ;; esac
+        [[ "$NF_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || die "id de destrucción inválido"
+        [[ "$NF_ENV" =~ ^(development|staging|production)$ ]] || die "ambiente inválido '${NF_ENV}'"
+        [[ "$NF_KEEP" =~ ^(true|false)$ ]] || die "keep-snapshots inválido '${NF_KEEP}'"
+        if [ "$NF_PHASE" != start ]; then
+          case "$NF_STATUS" in succeeded|failed) ;; *) die "estado desconocido '${NF_STATUS}'" ;; esac
+        fi
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          die "el job no tiene 'permissions: id-token: write'"
+        fi
+        oidc=$(curl -sS --fail --max-time 10 --retry 3 --retry-connrefused \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value') || true
+        if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+          die "GitHub no devolvió un token OIDC para la audiencia ${NF_AUDIENCE}"
+        fi
+
+        dir="$RUNNER_TEMP/nf-report-destroy"
+        mkdir -p "$dir"
+        # Los archivos que no existen (un paso anterior falló) viajan como null.
+        json_or_null() { if [ -n "$1" ] && [ -s "$1" ] && jq -e . "$1" >/dev/null 2>&1; then echo "$1"; else echo null > "$dir/null.json"; echo "$dir/null.json"; fi; }
+        plan_file=$(json_or_null "$NF_PLAN_FILE")
+        result_file=$(json_or_null "$NF_RESULT_FILE")
+
+        payload="$dir/payload-${NF_PHASE}.json"
+        jq -n \
+          --arg id "$NF_ID" --arg phase "$NF_PHASE" --arg mode "$NF_MODE" --arg env "$NF_ENV" \
+          --arg keep "$NF_KEEP" --arg status "$NF_STATUS" \
+          --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+          --arg ecode "$NF_ERROR_CODE" --arg emsg "$NF_ERROR_MESSAGE" \
+          --slurpfile plan "$plan_file" --slurpfile result "$result_file" \
+          '{destroyId: $id, phase: $phase, mode: $mode, environment: $env,
+            keepSnapshots: ($keep == "true"), headSha: $sha,
+            runId: ($run | tonumber), runAttempt: ($attempt | tonumber)}
+           + (if $status != "" then {status: $status} else {} end)
+           + (if $phase == "plan" and $plan[0] != null then {plan: $plan[0]} else {} end)
+           + (if $phase == "destroy" and $result[0] != null then {result: $result[0]} else {} end)
+           + (if $ecode != "" or $emsg != "" then {error: {code: $ecode, message: ($emsg | .[0:2000])}} else {} end)' \
+          > "$payload" || die "no se pudo armar el cuerpo"
+
+        body="$dir/response-${NF_PHASE}.json"
+        code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 --retry 4 --retry-connrefused \
+          -X POST "${NF_API_URL%/}/v1/ci/infra-destroys" \
+          -H "Authorization: Bearer ${oidc}" \
+          -H 'Content-Type: application/json' \
+          -H 'Accept: application/json' \
+          --data-binary "@$payload") || code="000"
+        detail() { jq -r '[.code, .message] | map(select(. != null and . != "")) | join(": ")' "$body" 2>/dev/null || true; }
+        case "$code" in
+          000) die "NanoFlow no respondió" ;;
+          200|201|202) ;;
+          *) d=$(detail); die "HTTP ${code}${d:+ ${d}}" ;;
+        esac
+        if [ "$NF_PHASE" = start ]; then
+          [ "$(jq -r '.authorized // false' "$body" 2>/dev/null)" = "true" ] || die "la respuesta no trae authorized = true"
+          echo "authorized=true" >> "$GITHUB_OUTPUT"
+          echo "NanoFlow autorizó la destrucción ${NF_ID} de ${NF_ENV} (modo ${NF_MODE})."
+        else
+          echo "NanoFlow registró $(what) de ${NF_ENV}: $(jq -r '.destroy.status // "sin estado"' "$body" 2>/dev/null)."
+        fi
