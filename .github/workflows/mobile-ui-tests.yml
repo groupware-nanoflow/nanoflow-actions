@@ -87,7 +87,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          count=$(find "$NF_FLOWS" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | wc -l | tr -d ' ')
+          # Sin la carpeta, find sale con error y pipefail tumbaría el paso:
+          # un repo sin flujos (el primer PR, el de la conexión) es no-flows.
+          count=0
+          if [ -d "$NF_FLOWS" ]; then
+            count=$(find "$NF_FLOWS" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) | wc -l | tr -d ' ')
+          fi
           echo "count=${count}" >> "$GITHUB_OUTPUT"
           if [ "$count" = "0" ]; then
             jq -n --arg dir "$NF_FLOWS" '{status: "no-flows", message: ("El repositorio no tiene flujos de Maestro en " + $dir + "/ (uno por criterio: <idDelCriterio>.yaml).")}' > "$NF_OUT/result.json"
