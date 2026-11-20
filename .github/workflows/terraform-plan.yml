@@ -246,8 +246,15 @@ jobs:
           TRIVY: ${{ steps.trivy.outcome }}
           NF_COLLISIONS: ${{ steps.reconcile.outputs.collisions }}
           NF_COLLISION_MSG: ${{ steps.reconcile.outputs.message }}
+          NF_REPORTED: ${{ steps.report.outputs.reported }}
         run: |
           fail=0
+          # Un plan que NanoFlow no registró no aparece en la consola para
+          # aprobarlo: el check falla para que se note y se vuelva a correr.
+          if [ "$NF_REPORTED" = "false" ]; then
+            echo "::error::NanoFlow no registró este plan (ver el paso «Informar el plan»): la consola no lo muestra para aprobarlo. Vuelve a correr este check (Re-run jobs)."
+            fail=1
+          fi
           if [ -n "$NF_COLLISIONS" ] && [ "$NF_COLLISIONS" != "0" ]; then
             echo "::error::${NF_COLLISION_MSG}"
             fail=1
