@@ -2,8 +2,9 @@ name: NanoFlow report plan
 description: >
   Resume un plan de Terraform (y el escaneo de trivy, si lo hay), lo informa a
   NanoFlow (POST /v1/ci/plans) con el token OIDC del job y deja el comentario
-  del PR listo en un archivo. Nunca falla el job: si NanoFlow no responde, deja
-  un aviso y sigue.
+  del PR listo en un archivo. Nunca falla el job: si NanoFlow no responde
+  (reintenta con espera creciente unos 3 minutos), deja un aviso, sigue y
+  devuelve reported=false para que el workflow decida el check.
 
 inputs:
   api-url:
@@ -57,6 +58,9 @@ outputs:
   has-changes:
     description: "'true' si el plan crea, cambia, reemplaza o destruye algo"
     value: ${{ steps.summarize.outputs.has-changes }}
+  reported:
+    description: "'true' si NanoFlow registró el plan; 'false' si no (la consola no lo verá hasta un nuevo intento)"
+    value: ${{ steps.report.outputs.reported }}
 
 runs:
   using: composite
@@ -161,13 +165,30 @@ runs:
             return 1
           }
 
+          # Un 5xx, un 429 o ningún código suelen ser pasajeros (p. ej. la base
+          # de datos sin conexiones libres por un momento): se reintenta con
+          # espera creciente, unos 3 minutos en total (con un token OIDC nuevo en
+          # cada intento: el anterior puede vencer). Un 4xx no cambia: no.
           body=$(mktemp)
-          code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 --retry 2 --retry-connrefused \
-            -X POST "${NF_API_URL%/}/v1/ci/plans" \
-            -H "Authorization: Bearer ${oidc}" \
-            -H 'Content-Type: application/json' \
-            -H 'Accept: application/json' \
-            --data-binary "@$payload") || code="000"
+          local attempt delay
+          for attempt in 1 2 3 4 5 6; do
+            if [ "$attempt" -gt 1 ]; then
+              oidc=$(curl -sS --fail --max-time 10 --retry 2 --retry-connrefused \
+                -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value') || true
+            fi
+            code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 \
+              -X POST "${NF_API_URL%/}/v1/ci/plans" \
+              -H "Authorization: Bearer ${oidc}" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json' \
+              --data-binary "@$payload") || code="000"
+            case "$code" in 000|429|5??) ;; *) break ;; esac
+            [ "$attempt" -eq 6 ] && break
+            delay=$(( attempt * attempt * 3 ))
+            echo "NanoFlow respondió ${code} (intento ${attempt}); reintento en ${delay} s" >&2
+            sleep "$delay"
+          done
           case "$code" in
             000) echo "NanoFlow no respondió"; rm -f "$body"; return 1 ;;
             200|201) echo "NanoFlow: plan registrado ($(jq -r '.planId // "sin id"' "$body"))."; rm -f "$body" ;;
@@ -176,8 +197,11 @@ runs:
         }
 
         if ! msg=$(report 2>&1); then
+          echo "$msg"
           echo "::warning::NanoFlow no registró el plan de ${NF_ENV}: ${msg##*$'\n'}"
+          echo "reported=false" >> "$GITHUB_OUTPUT"
         else
           echo "$msg"
+          echo "reported=true" >> "$GITHUB_OUTPUT"
         fi
         exit 0
