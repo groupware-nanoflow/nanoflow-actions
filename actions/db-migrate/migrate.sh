@@ -465,6 +465,30 @@ snapshot() {
   done
 }
 
+# mismatch_message <respuesta con CHECKSUM_MISMATCH>: el mensaje del error
+# explicado con el estado aplicado (status sin archivos) y los archivos de la
+# rama. El migrador compara por versión, así que un 0001 de otro nombre es otro
+# repositorio que migra la misma base (consola doc 49 §16: app-db de users-api
+# y pj-api), no un archivo editado. Usa $db, $dir, $work y $files.
+mismatch_message() {
+  local resp="$1" v applied_name applied_by local_name
+  v=$(jq -r '.error.version // ""' "$resp")
+  if [ -z "$v" ]; then jq -r '.error.message' "$resp"; return; fi
+  migrator status no "$work/applied.json" >/dev/null 2>&1 || true
+  applied_name=$(jq -r --arg v "$v" '[.applied[]? | select(.version == $v) | .name] | first // ""' "$work/applied.json" 2>/dev/null || true)
+  applied_by=$(jq -r --arg v "$v" '[.applied[]? | select(.version == $v) | .appliedBy // ""] | first // ""' "$work/applied.json" 2>/dev/null || true)
+  local_name=$(jq -r --arg v "$v" '[.[] | select(.name | startswith($v + "_")) | .name] | first // ""' "$files")
+  local by=""
+  [ -n "$applied_by" ] && by=" desde el commit ${applied_by:0:12}"
+  if [ -n "$applied_name" ] && [ -n "$local_name" ] && [ "$applied_name" != "$local_name" ]; then
+    echo "la versión ${v} de ${db} ya la aplicó otro archivo, ${applied_name}${by}, y este repositorio trae ${local_name}: dos repositorios migran la misma base. Solo el repositorio dueño de ${db} (data[].owner en la arquitectura) trae sus migraciones: elige el dueño en Arquitectura y, en los demás repositorios, quita ${dir} y la entrada '${db}' de 'databases' en .nanoflow/deploy.yml (sus tablas las crea una migración del dueño)."
+  elif [ -n "$applied_name" ] && [ -z "$local_name" ]; then
+    echo "la versión ${v} de ${db} (${applied_name}${by}) está aplicada pero no está en ${dir}. Si otro repositorio migra la misma base, solo el dueño (data[].owner en la arquitectura) trae sus migraciones; si el archivo se borró, restáuralo: una migración aplicada no se borra ni se edita, se corrige con otra nueva."
+  else
+    echo "$(jq -r '.error.message' "$resp"). Una migración aplicada no se edita: deja ${local_name:-el archivo} como estaba y corrige con una migración nueva."
+  fi
+}
+
 # ---------------------------------------------------------------- cada base
 final_status=succeeded
 final_error=""
@@ -568,7 +592,7 @@ for i in $(seq 0 $((count - 1))); do
     case "$drift" in
       in_sync) summary="${summary}| ${db} | ✓ en sincronía | |"$'\n' ;;
       pending) summary="${summary}| ${db} | ⚠ pendientes: $(jq -r '.pending | join(", ")' "$work/drift.json") | |"$'\n' ;;
-      mismatch) fail SCHEMA_DRIFT "la base no coincide con ${dir}: $(jq -r '.error.message' "$work/drift.json")" ;;
+      mismatch) fail SCHEMA_DRIFT "la base no coincide con ${dir}: $(mismatch_message "$work/drift.json")" ;;
       *) fail "$(jq -r '.error.code' "$work/drift.json")" "$(jq -r '.error.message' "$work/drift.json")" ;;
     esac
     continue
@@ -589,9 +613,13 @@ for i in $(seq 0 $((count - 1))); do
   fi
   migrator status yes "$work/before.json"
   if ! jq -e '.ok' "$work/before.json" >/dev/null; then
+    msg=$(jq -r '.error.message' "$work/before.json")
+    if [ "$(jq -r '.error.code' "$work/before.json")" = "CHECKSUM_MISMATCH" ]; then
+      msg=$(mismatch_message "$work/before.json")
+    fi
     echo "::endgroup::"
     report "$db" "$work/before.json" "" ""
-    fail "$(jq -r '.error.code' "$work/before.json")" "$(jq -r '.error.message' "$work/before.json")"; break
+    fail "$(jq -r '.error.code' "$work/before.json")" "$msg"; break
   fi
   pending=$(jq -r '.pending[]?' "$work/before.json")
   echo "Pendientes: $(echo ${pending:-ninguna})"
