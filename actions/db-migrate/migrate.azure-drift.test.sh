@@ -144,6 +144,25 @@ run "$mismatch" "$(admin_json "$app_ref")"; rc=$?
   grep -qx 'cli status dir=no url=set app=set' "$tmp/calls" && read_only && no_secret_leak; }
 check "la base no coincide con el repo: informa drift=mismatch con el estado aplicado y falla el job" $?
 
+# Consola doc 49 §16: el 0001 aplicado es de otro archivo (otro repositorio
+# migra la misma base), o es el mismo archivo editado.
+mismatch_v='{"ok": false, "applied": [], "pending": [], "error": {"code": "CHECKSUM_MISMATCH", "version": "0001", "message": "0001_init.sql changed after being applied (checksum differs)"}}'
+other_repo='{"ok": true, "pending": [], "applied": [{"version": "0001", "name": "0001_create_users_table.sql", "kind": "expand", "checksum": "abc", "appliedBy": "d0c6ac9fac4867a30ea2637a0c08cb30d9ed4e9b"}]}'
+run "$mismatch_v" "$(admin_json "$app_ref")" FAKE_STATUS_ALL="$other_repo"; rc=$?
+{ [ $rc -eq 1 ] && has "error=app-db: SCHEMA_DRIFT" &&
+  grep -qF 'ya la aplicó otro archivo, 0001_create_users_table.sql desde el commit d0c6ac9fac48, y este repositorio trae 0001_init.sql: dos repositorios migran la misma base' "$tmp/log" &&
+  grep -qF "data[].owner" "$tmp/log" && read_only && no_secret_leak; }
+check "el 0001 aplicado es de otro archivo: dice que dos repositorios migran la misma base y que elija el dueño" $?
+same_file='{"ok": true, "pending": [], "applied": [{"version": "0001", "name": "0001_init.sql", "kind": "expand", "checksum": "abc"}]}'
+run "$mismatch_v" "$(admin_json "$app_ref")" FAKE_STATUS_ALL="$same_file"; rc=$?
+{ [ $rc -eq 1 ] && grep -qF 'changed after being applied (checksum differs). Una migración aplicada no se edita: deja 0001_init.sql como estaba' "$tmp/log" &&
+  ! grep -qF 'dos repositorios' "$tmp/log"; }
+check "el mismo archivo editado: dice que una migración aplicada no se edita" $?
+gone='{"ok": false, "applied": [], "pending": [], "error": {"code": "CHECKSUM_MISMATCH", "version": "0002", "message": "applied version 0002 is missing from the migration files"}}'
+run "$gone" "$(admin_json "$app_ref")" FAKE_STATUS_ALL='{"ok": true, "pending": [], "applied": [{"version": "0002", "name": "0002_create_pj.sql", "checksum": "x"}]}'; rc=$?
+{ [ $rc -eq 1 ] && grep -qF 'la versión 0002 de app-db (0002_create_pj.sql) está aplicada pero no está en db/migrations' "$tmp/log"; }
+check "una versión aplicada que falta en el repositorio: nombra el archivo y las dos causas" $?
+
 run "$broken" "$(admin_json "$app_ref")"; rc=$?
 { [ $rc -eq 1 ] && has "status=failed" && has "error=app-db: CONNECT_FAILED" && rep '.status == "failed" and .drift == null and .error.code == "CONNECT_FAILED" and .state == null' && no_secret_leak; }
 check "el migrador no pudo leer la base: informa failed sin drift y falla el job" $?
