@@ -516,7 +516,7 @@ for i in $(seq 0 $((count - 1))); do
   fi
   echo "::group::${db} (${fn})"
 
-  db_identifier=""; db_cluster=false; db_url=""; app_password=""
+  db_identifier=""; db_cluster=false; db_name=""; db_url=""; app_password=""
   if [[ "$fn" =~ ^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret: ]]; then
     # Supabase: la CLI en el runner con los secretos de la cuenta del ambiente.
     runner=true
@@ -563,6 +563,9 @@ for i in $(seq 0 $((count - 1))); do
     fi
     db_identifier=$(jq -r '.Environment.Variables.DB_IDENTIFIER // ""' <<< "$cfg")
     db_cluster=$(jq -r '.Environment.Variables.DB_CLUSTER // "false"' <<< "$cfg")
+    # Una base alojada en la instancia de otra (consola doc 50) trae su
+    # propio DB_NAME; la base propia de la instancia es siempre `app`.
+    db_name=$(jq -r '.Environment.Variables.DB_NAME // ""' <<< "$cfg")
   fi
 
   # Archivos (no recursivo, por nombre) como [{name, sql}].
@@ -648,6 +651,9 @@ for i in $(seq 0 $((count - 1))); do
       first=$(head -n 1 <<< "$pending")
       snap="${db_identifier}-pre-${first}-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-1}"
       echo "Snapshot ${snap} antes de${risky}"
+      if [ -n "$db_name" ] && [ "$db_name" != app ]; then
+        echo "::warning::${db}: el snapshot es de toda la instancia ${db_identifier}, que también aloja otras bases. Restaurarlo vuelve atrás todas sus bases, no solo ${db}."
+      fi
       if ! msg=$(snapshot "$db_identifier" "$db_cluster" "$snap" 2>&1); then
         echo "::endgroup::"
         fail SNAPSHOT_FAILED "no se pudo crear el snapshot ${snap}: ${msg##*$'\n'}"; break
