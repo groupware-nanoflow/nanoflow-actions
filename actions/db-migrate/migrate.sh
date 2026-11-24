@@ -642,7 +642,7 @@ for i in $(seq 0 $((count - 1))); do
     elif [ -n "$risky" ] && [ "$runner" = queue ]; then
       # El job migrador corre dentro del ambiente y no crea snapshot: el
       # servidor flexible tiene restauración a un punto en el tiempo.
-      echo "::warning::${db}: hay migraciones${risky} en ${NF_ENVIRONMENT} y el migrador de Azure no crea snapshot. Si hay que volver atrás, restaura el servidor flexible a un punto en el tiempo anterior a este despliegue."
+      echo "::warning::${db}: hay migraciones${risky} en ${NF_ENVIRONMENT} y el migrador de Azure no crea snapshot. Si hay que volver atrás, restaura el servidor flexible a un punto en el tiempo anterior a este despliegue; la restauración incluye todas las bases del servidor (consola doc 50 §15)."
     elif [ -n "$risky" ]; then
       if [ -z "$db_identifier" ]; then
         echo "::endgroup::"
