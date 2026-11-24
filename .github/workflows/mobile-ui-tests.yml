@@ -46,9 +46,12 @@ on:
         type: number
         default: 34
       maestro-version:
+        # 2.x: setOrientation y los comandos que la documentación de Maestro da
+        # hoy. Con la 1.40.0 un comando que no conoce tumba todos los flujos
+        # antes de correr el primero (doc 53 §12 de la consola).
         description: Versión de la CLI de Maestro.
         type: string
-        default: "1.40.0"
+        default: "2.12.1"
       flows:
         description: Carpeta de los flujos.
         type: string
@@ -199,6 +202,10 @@ jobs:
           maestro test "$flows" --format junit --output "$NF_OUT/report.xml" --debug-output "$NF_OUT/debug" \
             -e NF_APP_ID="$NF_APP_ID" -e NF_TEST_USERNAME="$NF_TEST_USERNAME" -e NF_TEST_PASSWORD="$NF_TEST_PASSWORD"
           rc=$?
+          # Desde Maestro 2.x, takeScreenshot escribe dentro de la salida de
+          # depuración de cada flujo (<flujo>/takeScreenshot/), no en la carpeta
+          # actual: se copian a screenshots/, donde las busca el evaluador.
+          find "$NF_OUT/debug" -type f -path '*/takeScreenshot/*.png' -exec cp -n {} "$NF_OUT/screenshots/" \; 2>/dev/null || true
           if [ "$rc" = "0" ]; then
             jq -n '{status: "passed", message: "Todos los flujos pasaron."}' > "$NF_OUT/result.json"
           else
