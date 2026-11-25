@@ -9,7 +9,9 @@
 #   - el ingest antes del evaluador, en la rama del feature, cuando el proyecto
 #     apagó las pruebas de UI de la plataforma: es la evidencia de la app.
 #
-# Sin environment, sin secretos y sin NanoFlow: solo compila y prueba. El
+# Sin environment, sin secretos y sin NanoFlow: solo compila y prueba, con
+# valores de relleno (.invalid) para la configuración que la app recibe al
+# compilar (doc 55 §8 de la consola). El
 # artifact nanoflow-build-check-<plataforma> lleva result.json (status passed |
 # failed, el paso, un mensaje y el conteo de pruebas) y los reportes JUnit.
 name: mobile-build-check
@@ -40,6 +42,22 @@ jobs:
     timeout-minutes: 40
     permissions:
       contents: read
+    # La configuración de la app por ambiente (contrato de plataforma, skill
+    # mobile: NF_API_URL, NF_ENVIRONMENT, NF_OIDC_*, NF_TENANT_CLAIM) llega al
+    # compilar, y la app puede negarse a compilar sin ella (p. ej. una tarea
+    # verifyIdentityConfig de Gradle, doc 55 §8 de la consola: feature prod
+    # 01a21305). Este check solo compila y corre pruebas unitarias, sin red ni
+    # ambiente: valores de relleno en un dominio .invalid, nunca reales, como
+    # los que usa el ci.yml del repositorio. NF_OIDC_AUDIENCE y
+    # NF_APP_LINK_HOST quedan vacías (son opcionales en el contrato).
+    env:
+      NF_ENVIRONMENT: development
+      NF_API_URL: https://api.nanoflow-build-check.invalid
+      NF_OIDC_ISSUER: https://identity.nanoflow-build-check.invalid/realms/nanoflow-build-check
+      NF_OIDC_CLIENT_ID: nanoflow-build-check
+      NF_OIDC_AUDIENCE: ""
+      NF_TENANT_CLAIM: tenant_id
+      NF_APP_LINK_HOST: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -96,8 +114,17 @@ jobs:
           xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i -E 'beta|release.candidate|_rc' | sort -V | tail -n 1 || true)
           if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode/Contents/Developer"; fi
           xcodebuild -version
-          # Sin Config/NanoFlow.xcconfig: la app lo incluye con #include?, así
-          # que compila sin la configuración de un ambiente.
+          # Config/NanoFlow.xcconfig con los valores de relleno del job (la app
+          # lo incluye con #include?; si el repositorio ya trae uno, se respeta).
+          # En un .xcconfig, // empieza un comentario.
+          if [ ! -f Config/NanoFlow.xcconfig ]; then
+            mkdir -p Config
+            xc() { printf '%s = %s\n' "$1" "$(printf '%s' "${!1:-}" | sed 's#//#/$()/#g')"; }
+            {
+              echo "// Generado por NanoFlow para compilar y probar: no lo edites ni lo versiones."
+              for v in NF_ENVIRONMENT NF_API_URL NF_OIDC_ISSUER NF_OIDC_CLIENT_ID NF_OIDC_AUDIENCE NF_TENANT_CLAIM NF_APP_LINK_HOST; do xc "$v"; done
+            } > Config/NanoFlow.xcconfig
+          fi
           source=(-project "${NF_XCODE_PROJECT}.xcodeproj")
           if [ "$NF_XCODE_WORKSPACE" = "true" ]; then source=(-workspace "${NF_XCODE_PROJECT}.xcworkspace"); fi
           udid=$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | test("^iPhone"))] | last | .udid // empty')
