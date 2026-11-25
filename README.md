@@ -119,18 +119,22 @@ jobs:
 - Pide su token OIDC y llama a `POST /v1/ci/mobile-test-session`. NanoFlow responde con:
   - las `NF_*` de development de la app;
   - el `appId`;
-  - el usuario de prueba de development (sin el admin).
+  - el usuario de prueba de development (sin el admin);
+  - `feature.slug`: el feature cuya rama se prueba (doc 53 §16 de la consola), si la rama es de uno.
 
   **Solo este workflow** recibe la sesión: el endpoint exige `job_workflow_ref` = `…/mobile-ui-tests.yml@…`.
 - Compila el debug de development:
   - Android: `assembleDevelopmentDebug`, en un emulador con KVM de perfil `pixel_6` (input `android-profile`) y teclado físico (input `android-hw-keyboard`, encendido): el teclado en pantalla no aparece ni tapa botones. Sin perfil, el emulador era de 320×640 y el teclado tapaba el «Sign In» de Keycloak. Con teclado físico, `hideKeyboard` de Maestro (en Android, la tecla Atrás) sale de la pantalla: los flujos no lo usan;
   - iOS: `xcodebuild build -sdk iphonesimulator` con `Config/NanoFlow.xcconfig`, en un simulador de iPhone.
-- Corre `maestro test .maestro --format junit` con Maestro 2.12.1 (input `maestro-version`), con `-e NF_APP_ID`, `-e NF_TEST_USERNAME` y `-e NF_TEST_PASSWORD`. La contraseña se enmascara. Con la 1.40.0 de antes, un comando de la 2.x como `setOrientation` tumbaba todos los flujos antes de correr el primero.
+- Los flujos van en una carpeta por feature, `.maestro/<slug>/<idDelCriterio>.yaml` (doc 53 §16 de la consola; el slug es el del feature: título + los 6 últimos hex de su id). Los de la raíz de `.maestro/` son de antes y siguen corriendo. Otra carpeta (p. ej. subflujos) no se corre sola, y `config.yaml` no es un flujo.
+- Corre `maestro test --format junit` una vez por carpeta (la del feature de la rama primero, la raíz al final) con Maestro 2.12.1 (input `maestro-version`), con `-e NF_APP_ID`, `-e NF_TEST_USERNAME` y `-e NF_TEST_PASSWORD`. La contraseña se enmascara. Con la 1.40.0 de antes, un comando de la 2.x como `setOrientation` tumbaba todos los flujos antes de correr el primero.
 - Sube el artifact `nanoflow-ui-tests-<plataforma>` con:
-  - `result.json`: `passed`, `failed`, `no-flows` o `setup-failed`, más un mensaje;
-  - `report.xml`;
-  - las capturas de `takeScreenshot` en `screenshots/` (Maestro 2.x las deja en la salida de depuración de cada flujo; el workflow las copia ahí);
-  - `debug/`, la salida de depuración de Maestro (en qué paso falló cada flujo y su captura).
+  - `result.json`: `passed`, `failed`, `no-flows` o `setup-failed`, más un mensaje, `feature`, `decidedBy` (`feature` o `all`) y `suites` (por carpeta: `dir`, `status`, `flows`, `failed`, `failedFlows`, `decides`);
+  - `report.xml`: un JUnit con todos los casos; los de una carpeta se llaman `<slug>/<flujo>`, los de la raíz conservan su nombre. Y `reports/<carpeta>.xml` por carpeta;
+  - las capturas de `takeScreenshot` en `screenshots/` (raíz) y `screenshots/<slug>/` (Maestro 2.x las deja en la salida de depuración de cada flujo; el workflow las copia ahí);
+  - `debug/<carpeta>/`, la salida de depuración de Maestro (en qué paso falló cada flujo y su captura).
+
+  **Qué decide el check:** si NanoFlow dio el feature de la rama y su carpeta tiene flujos, solo ella. Las demás carpetas son regresión: salen en `result.json` y como avisos, pero no ponen el check en rojo. Sin feature (`develop`, `main`) o sin flujos en su carpeta, deciden todas, como antes.
 
   Antes de subirlo, reemplaza la contraseña por `***` en los archivos de texto (tal cual y escapada como en JSON) y quita cualquier archivo en que siga apareciendo. Es la evidencia del evaluador de NanoFlow.
 - Sin flujos en `.maestro/`, termina en verde con `no-flows`.
