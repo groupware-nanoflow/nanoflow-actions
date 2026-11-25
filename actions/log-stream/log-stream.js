@@ -7,7 +7,7 @@
 //
 // Cada línea se vuelve a imprimir en stdout en cuanto llega (GitHub sigue
 // mostrando y guardando todo), se redacta y se envía por lotes (≈1 s o 200
-// líneas) a POST ${NF_API_URL}/v1/ci/logs con el token OIDC del job.
+// líneas) a POST ${NF_LOG_API_URL}/v1/ci/logs con el token OIDC del job.
 //
 // Tres reglas que mandan sobre todo lo demás:
 //
@@ -21,7 +21,7 @@
 //   3. Sin dependencias: corre con el node que traen los runners (≥ 20, fetch
 //      global), sin npm install.
 //
-// Sin NF_API_URL, NF_AUDIENCE o el permiso id-token: write, pasa a modo
+// Sin NF_LOG_API_URL, NF_LOG_AUDIENCE o el permiso id-token: write, pasa a modo
 // solo-eco: imprime y no envía nada.
 'use strict';
 
@@ -520,7 +520,7 @@ function positiveInt(s) {
 // streamingEnabled dice si hay con qué enviar. Si no, el filtro es un `cat`.
 function streamingEnabled(env, args) {
   if (String(env.NF_LIVE_LOGS || 'true').toLowerCase() === 'false') return false;
-  return Boolean(env.NF_API_URL && env.NF_AUDIENCE &&
+  return Boolean(env.NF_LOG_API_URL && env.NF_LOG_AUDIENCE &&
     env.ACTIONS_ID_TOKEN_REQUEST_URL && env.ACTIONS_ID_TOKEN_REQUEST_TOKEN &&
     args.job && args.step && typeof globalThis.fetch === 'function');
 }
@@ -549,12 +549,12 @@ function main() {
         step: args.step,
         stepNumber: args.stepNumber,
         checkRunId: positiveInt(env.NF_CHECK_RUN_ID),
-        sender: new Sender({ apiUrl: env.NF_API_URL, audience: env.NF_AUDIENCE, env }),
+        sender: new Sender({ apiUrl: env.NF_LOG_API_URL, audience: env.NF_LOG_AUDIENCE, env }),
         redactor: new Redactor(env),
         startN: readCounter(counter),
         notify,
       });
-    } else if (env.NF_API_URL && !env.ACTIONS_ID_TOKEN_REQUEST_URL) {
+    } else if (env.NF_LOG_API_URL && !env.ACTIONS_ID_TOKEN_REQUEST_URL) {
       stdout.write("::debug::log-stream en modo solo-eco: el job no tiene 'permissions: id-token: write'.\n");
     }
   } catch {

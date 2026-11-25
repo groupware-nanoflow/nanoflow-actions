@@ -73,10 +73,14 @@ runs:
           enabled=false
         fi
 
+        # Nombres propios (NF_LOG_*), nunca los del contrato de plataforma: la
+        # app se compila con NF_API_URL, la URL del API del proyecto. Escribir
+        # aquí la del API de NanoFlow la pisaba para el resto del job (el APK
+        # quedaba apuntando a NanoFlow; doc 56 de la consola).
         {
           echo "NF_LOG_STREAM=${NF_SCRIPT}"
-          echo "NF_API_URL=${IN_API_URL}"
-          echo "NF_AUDIENCE=${IN_AUDIENCE}"
+          echo "NF_LOG_API_URL=${IN_API_URL}"
+          echo "NF_LOG_AUDIENCE=${IN_AUDIENCE}"
           echo "NF_CHECK_RUN_ID=${IN_CHECK_RUN_ID}"
           echo "NF_MASK_ENV=${mask_env}"
           echo "NF_LIVE_LOGS=${enabled}"
