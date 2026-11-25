@@ -123,15 +123,16 @@ jobs:
 
   **Solo este workflow** recibe la sesión: el endpoint exige `job_workflow_ref` = `…/mobile-ui-tests.yml@…`.
 - Compila el debug de development:
-  - Android: `assembleDevelopmentDebug`, en un emulador con KVM;
+  - Android: `assembleDevelopmentDebug`, en un emulador con KVM de perfil `pixel_6` (input `android-profile`) y teclado físico (input `android-hw-keyboard`, encendido): el teclado en pantalla no aparece ni tapa botones. Sin perfil, el emulador era de 320×640 y el teclado tapaba el «Sign In» de Keycloak. Con teclado físico, `hideKeyboard` de Maestro (en Android, la tecla Atrás) sale de la pantalla: los flujos no lo usan;
   - iOS: `xcodebuild build -sdk iphonesimulator` con `Config/NanoFlow.xcconfig`, en un simulador de iPhone.
 - Corre `maestro test .maestro --format junit` con Maestro 2.12.1 (input `maestro-version`), con `-e NF_APP_ID`, `-e NF_TEST_USERNAME` y `-e NF_TEST_PASSWORD`. La contraseña se enmascara. Con la 1.40.0 de antes, un comando de la 2.x como `setOrientation` tumbaba todos los flujos antes de correr el primero.
 - Sube el artifact `nanoflow-ui-tests-<plataforma>` con:
   - `result.json`: `passed`, `failed`, `no-flows` o `setup-failed`, más un mensaje;
   - `report.xml`;
-  - las capturas de `takeScreenshot` en `screenshots/` (Maestro 2.x las deja en la salida de depuración de cada flujo; el workflow las copia ahí).
+  - las capturas de `takeScreenshot` en `screenshots/` (Maestro 2.x las deja en la salida de depuración de cada flujo; el workflow las copia ahí);
+  - `debug/`, la salida de depuración de Maestro (en qué paso falló cada flujo y su captura).
 
-  Antes de subirlo, quita cualquier archivo que contenga la contraseña. Es la evidencia del evaluador de NanoFlow.
+  Antes de subirlo, reemplaza la contraseña por `***` en los archivos de texto (tal cual y escapada como en JSON) y quita cualquier archivo en que siga apareciendo. Es la evidencia del evaluador de NanoFlow.
 - Sin flujos en `.maestro/`, termina en verde con `no-flows`.
 
 ### Compilación y pruebas unitarias de una app (`mobile-build-check.yml`)

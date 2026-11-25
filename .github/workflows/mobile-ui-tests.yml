@@ -19,8 +19,9 @@
 #
 # El artifact nanoflow-ui-tests-<plataforma> es la evidencia del evaluador:
 # result.json (status passed | failed | no-flows | setup-failed y un mensaje),
-# report.xml (JUnit: un caso por flujo, .maestro/<idDelCriterio>.yaml) y las
-# capturas.
+# report.xml (JUnit: un caso por flujo, .maestro/<idDelCriterio>.yaml), las
+# capturas y la salida de depuración de Maestro (debug/), con la contraseña
+# reemplazada por ***.
 name: mobile-ui-tests
 
 on:
@@ -50,6 +51,18 @@ on:
         description: Android — nivel de API del emulador.
         type: number
         default: 34
+      android-profile:
+        # Sin perfil, el emulador era de 320×640: el formulario de Keycloak
+        # apenas cabía y el teclado tapaba «Sign In» (doc 53 §15 de la consola).
+        description: Android — perfil de hardware del emulador (avdmanager list device).
+        type: string
+        default: pixel_6
+      android-hw-keyboard:
+        # Con teclado físico, Android no abre el teclado en pantalla y no tapa
+        # botones. Ojo: hideKeyboard de Maestro en Android es la tecla Atrás.
+        description: Android — emulador con teclado físico (sin teclado en pantalla).
+        type: boolean
+        default: true
       maestro-version:
         # 2.x: setOrientation y los comandos que la documentación de Maestro da
         # hoy. Con la 1.40.0 un comando que no conoce tumba todos los flujos
@@ -274,8 +287,15 @@ jobs:
           api-level: ${{ inputs.android-api-level }}
           target: google_apis
           arch: x86_64
+          profile: ${{ inputs.android-profile }}
           disable-animations: true
-          script: adb install -r "$NF_APK" && "$RUNNER_TEMP/nf-maestro.sh"
+          # Con teclado físico, Android no abre el teclado en pantalla: no tapa
+          # el botón que el flujo toca después de escribir (el «Sign In» de
+          # Keycloak, doc 53 §15). inputText de Maestro escribe igual; en
+          # cambio hideKeyboard, que en Android es la tecla Atrás, sale de la
+          # pantalla: el skill mobile del harness dice que no se use.
+          enable-hw-keyboard: ${{ inputs.android-hw-keyboard }}
+          script: adb install -r "$NF_APK" && adb shell settings put secure show_ime_with_hard_keyboard 0 && "$RUNNER_TEMP/nf-maestro.sh"
 
       # -------------------------------------------------------------------- iOS
       - name: Compilar el debug de development (iOS)
@@ -329,10 +349,28 @@ jobs:
             echo
             echo "**$(jq -r '.status' "$NF_OUT/result.json" 2>/dev/null || echo 'setup-failed')** — $(jq -r '.message' "$NF_OUT/result.json" 2>/dev/null || echo 'sin result.json')"
           } >> "$GITHUB_STEP_SUMMARY"
-          # Nada del usuario de prueba sale en el artifact: se revisa por si un
-          # flujo lo imprimió en un log de depuración.
+          # La contraseña del usuario de prueba nunca sale en el artifact. Los
+          # logs de depuración de Maestro (commands-*.json, maestro.log) la
+          # traen en el inputText del login: se reemplaza por *** y el log se
+          # conserva, porque dice en qué paso falló cada flujo (doc 53 §15).
+          # Se busca tal cual y escapada como en JSON. Un archivo binario que
+          # la contenga, o uno en que quedara tras reemplazarla, se quita.
           if [ -n "${NF_TEST_PASSWORD:-}" ]; then
-            grep -rlF -- "$NF_TEST_PASSWORD" "$NF_OUT" 2>/dev/null | while read -r f; do rm -f "$f"; echo "::warning::Se quitó ${f#$NF_OUT/} del artifact: contenía la contraseña del usuario de prueba."; done
+            NF_PW_JSON=$(jq -rn --arg p "$NF_TEST_PASSWORD" '$p | @json | .[1:-1]')
+            export NF_PW_JSON
+            masked=0
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if grep -qIF -e "$NF_TEST_PASSWORD" -e "$NF_PW_JSON" -- "$f"; then
+                perl -pi -e 's/\Q$ENV{NF_PW_JSON}\E/***/g; s/\Q$ENV{NF_TEST_PASSWORD}\E/***/g' -- "$f"
+                masked=$((masked + 1))
+              fi
+              if grep -qF -e "$NF_TEST_PASSWORD" -e "$NF_PW_JSON" -- "$f"; then
+                rm -f -- "$f"
+                echo "::warning::Se quitó ${f#$NF_OUT/} del artifact: contenía la contraseña del usuario de prueba."
+              fi
+            done < <(grep -rlF -e "$NF_TEST_PASSWORD" -e "$NF_PW_JSON" -- "$NF_OUT" 2>/dev/null || true)
+            if [ "$masked" != "0" ]; then echo "La contraseña se reemplazó por *** en ${masked} archivos de la salida de depuración."; fi
           fi
 
       - name: Artifact de evidencia
