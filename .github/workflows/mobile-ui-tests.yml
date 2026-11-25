@@ -17,10 +17,19 @@
 # antes de arrancar el emulador o macOS. Apagadas, ui-tests queda «skipped» y
 # la corrida termina en verde. Si la pregunta falla, las pruebas corren.
 #
+# Los flujos van en una carpeta por feature, .maestro/<slug>/<idDelCriterio>.yaml
+# (doc 53 §16 de la consola): el slug es el del feature (título + los 6 últimos
+# hex de su id). Los de la raíz de .maestro/ son de antes y siguen corriendo.
+# Corren todos, una carpeta a la vez; si NanoFlow dice de qué feature es la
+# rama y su carpeta tiene flujos, solo ella decide el check: las demás son
+# regresión, se ven en result.json y en avisos, pero no lo ponen en rojo.
+#
 # El artifact nanoflow-ui-tests-<plataforma> es la evidencia del evaluador:
-# result.json (status passed | failed | no-flows | setup-failed y un mensaje),
-# report.xml (JUnit: un caso por flujo, .maestro/<idDelCriterio>.yaml), las
-# capturas y la salida de depuración de Maestro (debug/), con la contraseña
+# result.json (status passed | failed | no-flows | setup-failed, un mensaje,
+# feature, decidedBy y suites), report.xml (JUnit: un caso por flujo; los de
+# una carpeta se llaman <slug>/<idDelCriterio>), reports/<carpeta>.xml, las
+# capturas (screenshots/ para la raíz, screenshots/<slug>/ para cada feature)
+# y la salida de depuración de Maestro (debug/<carpeta>/), con la contraseña
 # reemplazada por ***.
 name: mobile-ui-tests
 
@@ -157,13 +166,20 @@ jobs:
           set -euo pipefail
           # Sin la carpeta, find sale con error y pipefail tumbaría el paso:
           # un repo sin flujos (el primer PR, el de la conexión) es no-flows.
+          # Cuentan los de la raíz y los de cada carpeta de feature (su nombre
+          # termina en -<6 hex>); config.yaml es la configuración de Maestro y
+          # otra carpeta (subflujos) no se corre sola.
           count=0
           if [ -d "$NF_FLOWS" ]; then
-            count=$(find "$NF_FLOWS" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) | wc -l | tr -d ' ')
+            count=$(find "$NF_FLOWS" -mindepth 1 -maxdepth 2 -type f \( -name '*.yaml' -o -name '*.yml' \) \
+              ! -name 'config.yaml' ! -name 'config.yml' | awk -F/ -v base="$NF_FLOWS" '
+                { rel = substr($0, length(base) + 2); n = split(rel, p, "/") }
+                n == 1 || (n == 2 && p[1] ~ /-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) { c++ }
+                END { print c + 0 }')
           fi
           echo "count=${count}" >> "$GITHUB_OUTPUT"
           if [ "$count" = "0" ]; then
-            jq -n --arg dir "$NF_FLOWS" '{status: "no-flows", message: ("El repositorio no tiene flujos de Maestro en " + $dir + "/ (uno por criterio: <idDelCriterio>.yaml).")}' > "$NF_OUT/result.json"
+            jq -n --arg dir "$NF_FLOWS" '{status: "no-flows", message: ("El repositorio no tiene flujos de Maestro en " + $dir + "/ (uno por criterio: " + $dir + "/<slug del feature>/<idDelCriterio>.yaml).")}' > "$NF_OUT/result.json"
             echo "::notice::No hay flujos de Maestro en ${NF_FLOWS}/: no hay nada que probar."
           else
             echo "${count} flujos en ${NF_FLOWS}/."
@@ -204,10 +220,12 @@ jobs:
             echo "NF_APP_ID=$(jq -r '.appId' "$body")"
             echo "NF_TEST_USERNAME=$(jq -r '.testUser.username' "$body")"
             echo "NF_TEST_PASSWORD=$(jq -r '.testUser.password' "$body")"
+            # El feature de la rama (doc 53 §16): su carpeta decide el check.
+            echo "NF_FEATURE_SLUG=$(jq -r '.feature.slug // empty | select(test("^[a-z0-9-]+$"))' "$body")"
             # Las NF_* de development de la app: las lee el build (Gradle o el .xcconfig).
             jq -r '.variables | to_entries[] | select(.key | test("^NF_[A-Z0-9_]+$")) | "\(.key)=\(.value)"' "$body"
           } >> "$GITHUB_ENV"
-          echo "Development · app $(jq -r '.appId' "$body") · usuario de prueba $(jq -r '.testUser.username' "$body")"
+          echo "Development · app $(jq -r '.appId' "$body") · usuario de prueba $(jq -r '.testUser.username' "$body") · feature $(jq -r '.feature.slug // "(la rama no es de un feature: deciden todos los flujos)"' "$body")"
 
       - name: Java
         if: steps.flows.outputs.count != '0'
@@ -263,21 +281,144 @@ jobs:
           #!/usr/bin/env bash
           set -uo pipefail
           flows="$(pwd)/${NF_FLOWS}"
-          cd "$NF_OUT/screenshots"
-          maestro test "$flows" --format junit --output "$NF_OUT/report.xml" --debug-output "$NF_OUT/debug" \
-            -e NF_APP_ID="$NF_APP_ID" -e NF_TEST_USERNAME="$NF_TEST_USERNAME" -e NF_TEST_PASSWORD="$NF_TEST_PASSWORD"
-          rc=$?
-          # Desde Maestro 2.x, takeScreenshot escribe dentro de la salida de
-          # depuración de cada flujo (<flujo>/takeScreenshot/), no en la carpeta
-          # actual: se copian a screenshots/, donde las busca el evaluador.
-          find "$NF_OUT/debug" -type f -path '*/takeScreenshot/*.png' -exec cp -n {} "$NF_OUT/screenshots/" \; 2>/dev/null || true
-          if [ "$rc" = "0" ]; then
-            jq -n '{status: "passed", message: "Todos los flujos pasaron."}' > "$NF_OUT/result.json"
-          else
-            jq -n --arg rc "$rc" '{status: "failed", message: ("Maestro terminó con código " + $rc + ": report.xml dice qué flujos fallaron.")}' > "$NF_OUT/result.json"
-          fi
-          exit "$rc"
+          slug="${NF_FEATURE_SLUG:-}"
+          runs="$NF_OUT/runs.txt"
+          mkdir -p "$NF_OUT/reports"
+          : > "$runs"
+          has_flows() { [ -n "$(find "$1" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) ! -name 'config.yaml' ! -name 'config.yml' -print -quit)" ]; }
+          # Las carpetas: primero la del feature de la rama (su resultado llega
+          # antes), después las de otros features y al final la raíz.
+          suites=()
+          if [ -n "$slug" ] && [ -d "$flows/$slug" ] && has_flows "$flows/$slug"; then suites+=("$slug"); fi
+          for d in "$flows"/*/; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            [ "$name" = "$slug" ] && continue
+            [[ "$name" =~ -[0-9a-f]{6}$ ]] || continue
+            has_flows "$d" && suites+=("$name")
+          done
+          if has_flows "$flows"; then suites+=("raiz"); fi
+          for label in "${suites[@]}"; do
+            if [ "$label" = "raiz" ]; then dir="$flows"; shots="$NF_OUT/screenshots"; else dir="$flows/$label"; shots="$NF_OUT/screenshots/$label"; fi
+            mkdir -p "$shots"
+            echo "::group::Flujos de ${NF_FLOWS}/$([ "$label" = "raiz" ] || echo "$label/")"
+            ( cd "$shots" && maestro test "$dir" --format junit --output "$NF_OUT/reports/$label.xml" --debug-output "$NF_OUT/debug/$label" \
+                -e NF_APP_ID="$NF_APP_ID" -e NF_TEST_USERNAME="$NF_TEST_USERNAME" -e NF_TEST_PASSWORD="$NF_TEST_PASSWORD" )
+            rc=$?
+            echo "::endgroup::"
+            # Desde Maestro 2.x, takeScreenshot escribe dentro de la salida de
+            # depuración de cada flujo (<flujo>/takeScreenshot/), no en la carpeta
+            # actual: se copian a la carpeta de capturas, donde las busca el evaluador.
+            find "$NF_OUT/debug/$label" -type f -path '*/takeScreenshot/*.png' -exec cp -n {} "$shots/" \; 2>/dev/null || true
+            echo "$label $rc" >> "$runs"
+          done
+          # Un solo report.xml, result.json y la decisión del check.
+          python3 -I "$RUNNER_TEMP/nf-maestro-result.py" "$NF_OUT" "$slug" "$runs"
+          code=$?
+          case "$code" in
+            0|3) ;;
+            *)
+              # El resumen falló: decide cualquier carpeta en rojo, como antes.
+              code=0
+              while read -r label rc; do [ "$rc" = "0" ] || code=3; done < "$runs"
+              if [ "$code" = "0" ]; then st=passed; msg="Todos los flujos pasaron (no se pudo armar el resumen por carpeta)."; else st=failed; msg="Algún flujo falló (no se pudo armar el resumen por carpeta): mira reports/."; fi
+              jq -n --arg s "$st" --arg m "$msg" '{status: $s, message: $m}' > "$NF_OUT/result.json"
+              ;;
+          esac
+          rm -f "$runs"
+          [ "$code" = "0" ]
           SH
+          # El resumen: junta los reportes en report.xml (los casos de una
+          # carpeta se llaman <slug>/<flujo>) y escribe result.json. Sale con 0
+          # si las carpetas que deciden pasaron y con 3 si no.
+          cat > "$RUNNER_TEMP/nf-maestro-result.py" <<'PY'
+          import json, os, sys
+          import xml.etree.ElementTree as ET
+
+          out, slug, runs_file = sys.argv[1], sys.argv[2], sys.argv[3]
+          runs = [line.split() for line in open(runs_file, encoding="utf-8") if line.strip()]
+          merged = ET.Element("testsuites")
+          suites = []
+          for label, rc in runs:
+              rc = int(rc)
+              root = label == "raiz"
+              flows, failed = 0, []
+              path = os.path.join(out, "reports", label + ".xml")
+              try:
+                  tree = ET.parse(path)
+              except (OSError, ET.ParseError):
+                  tree = None
+              if tree is not None:
+                  for ts in tree.getroot().iter("testsuite"):
+                      ts.set("name", "raiz" if root else label)
+                      for tc in ts.findall("testcase"):
+                          name = tc.get("name") or tc.get("id") or "?"
+                          if not root:
+                              for attr in ("id", "name", "classname"):
+                                  if tc.get(attr) is not None:
+                                      tc.set(attr, label + "/" + tc.get(attr))
+                          flows += 1
+                          if tc.find("failure") is not None or tc.find("error") is not None:
+                              failed.append(name)
+                      merged.append(ts)
+              suites.append({
+                  "dir": "." if root else label,
+                  "status": "passed" if rc == 0 else "failed",
+                  "flows": flows,
+                  "failed": len(failed),
+                  "failedFlows": failed[:50],
+                  "exitCode": rc,
+              })
+          ET.ElementTree(merged).write(os.path.join(out, "report.xml"), encoding="UTF-8", xml_declaration=True)
+
+          own = [s for s in suites if slug and s["dir"] == slug]
+          deciding = own or suites
+          for s in suites:
+              s["decides"] = s in deciding
+          ok = all(s["status"] == "passed" for s in deciding)
+
+          def upper_first(t):
+              return t[:1].upper() + t[1:]
+
+          def where(s):
+              return "la raíz de .maestro/" if s["dir"] == "." else ".maestro/" + s["dir"] + "/"
+
+          def detail(s):
+              if s["status"] == "passed":
+                  return "los %d flujos de %s pasaron" % (s["flows"], where(s))
+              if s["flows"] == 0:
+                  return "%s: Maestro terminó con código %d antes de correr un flujo (mira el log)" % (where(s), s["exitCode"])
+              return "%d de %d flujos de %s fallaron (%s)" % (s["failed"], s["flows"], where(s), ", ".join(s["failedFlows"][:10]))
+
+          if own:
+              msg = upper_first(detail(own[0])) + "."
+              others = [s for s in suites if not s["decides"]]
+              bad = [s for s in others if s["status"] != "passed"]
+              if bad:
+                  msg += " Regresión de otras carpetas (no decide el check): " + "; ".join(detail(s) for s in bad) + "."
+              elif others:
+                  msg += " Regresión: los flujos de las otras %d carpetas pasaron." % len(others)
+          else:
+              total = sum(s["flows"] for s in suites)
+              bad = [s for s in suites if s["status"] != "passed"]
+              msg = ("Todos los flujos pasaron (%d)." % total) if not bad else (upper_first("; ".join(detail(s) for s in bad)) + ": report.xml dice cuáles.")
+              if slug:
+                  msg += " La carpeta del feature, .maestro/" + slug + "/, no tiene flujos: deciden todos."
+
+          result = {
+              "status": "passed" if ok else "failed",
+              "message": msg,
+              "feature": slug or None,
+              "decidedBy": "feature" if own else "all",
+              "suites": suites,
+          }
+          with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False, indent=2)
+          for s in suites:
+              if not s["decides"] and s["status"] != "passed":
+                  print("::warning::Regresión: " + detail(s))
+          sys.exit(0 if ok else 3)
+          PY
           chmod +x "$RUNNER_TEMP/nf-maestro.sh"
 
       - name: Pruebas en el emulador (Android)
