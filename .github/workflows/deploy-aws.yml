@@ -199,7 +199,7 @@ jobs:
       # build y deploy pasan su salida por log-stream, que la sigue imprimiendo
       # aquí y la reenvía a NanoFlow. Con live-logs: false queda en solo-eco.
       - name: Preparar el log en vivo
-        uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v1
+        uses: groupware-nanoflow/nanoflow-actions/actions/log-stream@v2
         with:
           api-url: ${{ inputs.api-url }}
           audience: ${{ inputs.audience }}

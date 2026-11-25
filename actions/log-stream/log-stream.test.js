@@ -96,11 +96,23 @@ test('lee los argumentos en las dos formas', () => {
 
 test('pasa a solo-eco sin API, sin audiencia, sin id-token o con live-logs apagado', () => {
   const args = { job: 'j', step: 's' };
-  const full = { NF_API_URL: 'https://api', NF_AUDIENCE: 'nanoflow-dev', ACTIONS_ID_TOKEN_REQUEST_URL: 'https://t?x=1', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'tok' };
+  const full = { NF_LOG_API_URL: 'https://api', NF_LOG_AUDIENCE: 'nanoflow-dev', ACTIONS_ID_TOKEN_REQUEST_URL: 'https://t?x=1', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'tok' };
   assert.equal(streamingEnabled(full, args), true);
   for (const k of Object.keys(full)) assert.equal(streamingEnabled({ ...full, [k]: '' }, args), false, k);
   assert.equal(streamingEnabled({ ...full, NF_LIVE_LOGS: 'false' }, args), false);
   assert.equal(streamingEnabled(full, { job: 'j', step: '' }), false);
+  // NF_API_URL es del contrato de plataforma (el API del proyecto): no cuenta.
+  const contractOnly = { ...full, NF_LOG_API_URL: '', NF_API_URL: 'https://api.proyecto' };
+  assert.equal(streamingEnabled(contractOnly, args), false);
+});
+
+test('la acción no escribe en GITHUB_ENV ninguna variable del contrato de plataforma', () => {
+  const yml = fs.readFileSync(path.join(__dirname, 'action.yml'), 'utf8');
+  const written = [...yml.matchAll(/echo "(NF_[A-Z0-9_]+)=/g)].map((m) => m[1]);
+  assert.ok(written.includes('NF_LOG_API_URL') && written.includes('NF_LOG_AUDIENCE'), written.join(' '));
+  const contract = ['NF_API_URL', 'NF_FRONTEND_URL', 'NF_IDENTITY_PROVIDER', 'NF_OIDC_ISSUER',
+    'NF_OIDC_AUDIENCE', 'NF_OIDC_CLIENT_ID', 'NF_TENANT_CLAIM', 'NF_ENVIRONMENT', 'NF_AUDIENCE'];
+  for (const name of written) assert.ok(!contract.includes(name), `${name} pisaría el contrato`);
 });
 
 // --- agrupado y numeración ---------------------------------------------------
@@ -380,8 +392,8 @@ test('reenvía redactado a la API y sigue imprimiendo todo', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'nf-ls-'));
   try {
     const { code, out } = await run({
-      NF_API_URL: base,
-      NF_AUDIENCE: 'nanoflow-dev',
+      NF_LOG_API_URL: base,
+      NF_LOG_AUDIENCE: 'nanoflow-dev',
       ACTIONS_ID_TOKEN_REQUEST_URL: `${base}/token?api-version=2.0`,
       ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'req',
       AWS_SECRET_ACCESS_KEY: 'topsecretvalue',
@@ -403,8 +415,8 @@ test('reenvía redactado a la API y sigue imprimiendo todo', async () => {
 
 test('con la API caída sale con 0 y un único aviso al final', async () => {
   const { code, out } = await run({
-    NF_API_URL: 'http://127.0.0.1:9',
-    NF_AUDIENCE: 'nanoflow-dev',
+    NF_LOG_API_URL: 'http://127.0.0.1:9',
+    NF_LOG_AUDIENCE: 'nanoflow-dev',
     ACTIONS_ID_TOKEN_REQUEST_URL: 'http://127.0.0.1:9/token?x=1',
     ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'req',
   }, 'a\nb');
