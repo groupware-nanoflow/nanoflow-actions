@@ -1,0 +1,150 @@
+# mobile-build-check.yml — compila una app nativa y corre sus pruebas unitarias
+# (docs 53 §9.3 y 54 de la consola de NanoFlow).
+#
+# Lo llama .github/workflows/nanoflow-build-check.yml, que NanoFlow agrega al
+# conectar un repositorio android o ios. Lo disparan:
+#   - el runner de NanoFlow durante el build (rama nanoflow/check/<job>, input
+#     nonce): el agente no tiene SDK de Android ni Xcode, así que compila aquí y
+#     corrige en la misma sesión si falla;
+#   - el ingest antes del evaluador, en la rama del feature, cuando el proyecto
+#     apagó las pruebas de UI de la plataforma: es la evidencia de la app.
+#
+# Sin environment, sin secretos y sin NanoFlow: solo compila y prueba. El
+# artifact nanoflow-build-check-<plataforma> lleva result.json (status passed |
+# failed, el paso, un mensaje y el conteo de pruebas) y los reportes JUnit.
+name: mobile-build-check
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: android | ios.
+        type: string
+        required: true
+      xcode-project:
+        description: iOS — el proyecto de Xcode de la raíz, sin .xcodeproj (su esquema compartido tiene el mismo nombre).
+        type: string
+        default: ""
+      xcode-workspace:
+        description: iOS — compilar <xcode-project>.xcworkspace en lugar del proyecto.
+        type: boolean
+        default: false
+      android-flavor:
+        description: Android — el flavor que se compila y se prueba.
+        type: string
+        default: development
+
+jobs:
+  build-check:
+    runs-on: ${{ inputs.platform == 'ios' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar la salida
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.platform }}' in
+            android|ios) ;;
+            *) echo "::error::platform debe ser android o ios."; exit 1 ;;
+          esac
+          NF_OUT="$RUNNER_TEMP/nanoflow-build-check"
+          echo "NF_OUT=$NF_OUT" >> "$GITHUB_ENV"
+          mkdir -p "$NF_OUT/junit"
+          jq -n '{status: "failed", step: "setup", message: "El job terminó antes de compilar: mira el log de la corrida."}' > "$NF_OUT/result.json"
+
+      # ---------------------------------------------------------------- Android
+      - name: Java
+        if: inputs.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Compilar y probar (Android)
+        if: inputs.platform == 'android'
+        shell: bash
+        env:
+          NF_FLAVOR: ${{ inputs.android-flavor }}
+        run: |
+          set -uo pipefail
+          chmod +x ./gradlew
+          flavor="$(tr '[:lower:]' '[:upper:]' <<< "${NF_FLAVOR:0:1}")${NF_FLAVOR:1}"
+          fail() { jq -n --arg s "$1" --arg m "$2" '{status: "failed", step: $s, message: $m}' > "$NF_OUT/result.json"; echo "::error::$2"; exit 1; }
+          ./gradlew --no-daemon "assemble${flavor}Debug" || fail build "No compiló el debug del flavor ${NF_FLAVOR} (./gradlew assemble${flavor}Debug): mira el log."
+          rc=0
+          ./gradlew --no-daemon "test${flavor}DebugUnitTest" || rc=$?
+          find . -path "*/build/test-results/test${flavor}DebugUnitTest/*.xml" -exec cp {} "$NF_OUT/junit/" \; 2>/dev/null || true
+          [ "$rc" = "0" ] || fail test "Fallaron pruebas unitarias (./gradlew test${flavor}DebugUnitTest): los reportes JUnit dicen cuáles."
+          jq -n --arg f "$NF_FLAVOR" '{status: "passed", step: "test", message: ("Compiló el debug de " + $f + " y pasaron sus pruebas unitarias.")}' > "$NF_OUT/result.json"
+
+      # -------------------------------------------------------------------- iOS
+      - name: Compilar y probar (iOS)
+        if: inputs.platform == 'ios'
+        shell: bash
+        env:
+          NF_XCODE_PROJECT: ${{ inputs.xcode-project }}
+          NF_XCODE_WORKSPACE: ${{ inputs.xcode-workspace }}
+        run: |
+          set -uo pipefail
+          fail() { jq -n --arg s "$1" --arg m "$2" '{status: "failed", step: $s, message: $m}' > "$NF_OUT/result.json"; echo "::error::$2"; exit 1; }
+          [ -n "$NF_XCODE_PROJECT" ] || fail setup "Falta xcode-project: vuelve a conectar el repositorio desde NanoFlow."
+          xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i -E 'beta|release.candidate|_rc' | sort -V | tail -n 1 || true)
+          if [ -n "$xcode" ]; then sudo xcode-select -s "$xcode/Contents/Developer"; fi
+          xcodebuild -version
+          # Sin Config/NanoFlow.xcconfig: la app lo incluye con #include?, así
+          # que compila sin la configuración de un ambiente.
+          source=(-project "${NF_XCODE_PROJECT}.xcodeproj")
+          if [ "$NF_XCODE_WORKSPACE" = "true" ]; then source=(-workspace "${NF_XCODE_PROJECT}.xcworkspace"); fi
+          udid=$(xcrun simctl list devices available -j | jq -r '[.devices[][] | select(.name | test("^iPhone"))] | last | .udid // empty')
+          [ -n "$udid" ] || fail setup "La imagen de macOS no tiene un simulador de iPhone disponible."
+          common=("${source[@]}" -scheme "$NF_XCODE_PROJECT" -configuration Debug -destination "id=${udid}" -derivedDataPath "$RUNNER_TEMP/dd" CODE_SIGNING_ALLOWED=NO)
+          log="$RUNNER_TEMP/build-for-testing.log"
+          if ! xcodebuild build-for-testing "${common[@]}" 2>&1 | tee "$log"; then
+            if grep -q -i 'not currently configured for the test action' "$log"; then
+              # El esquema no tiene pruebas: basta con que compile.
+              xcodebuild build "${common[@]}" || fail build "No compiló el esquema ${NF_XCODE_PROJECT} para el simulador: mira el log."
+              jq -n '{status: "passed", step: "build", message: "Compiló; el esquema no tiene acción de pruebas, así que no hay pruebas unitarias que correr."}' > "$NF_OUT/result.json"
+              exit 0
+            fi
+            fail build "No compiló el esquema ${NF_XCODE_PROJECT} para pruebas en el simulador: mira el log."
+          fi
+          rc=0
+          xcodebuild test-without-building "${common[@]}" -resultBundlePath "$RUNNER_TEMP/tests.xcresult" || rc=$?
+          if [ -d "$RUNNER_TEMP/tests.xcresult" ]; then
+            xcrun xcresulttool get test-results summary --path "$RUNNER_TEMP/tests.xcresult" > "$NF_OUT/junit/xcresult-summary.json" 2>/dev/null || true
+          fi
+          [ "$rc" = "0" ] || fail test "Fallaron pruebas del esquema ${NF_XCODE_PROJECT} (xcodebuild test-without-building): mira el log."
+          jq -n '{status: "passed", step: "test", message: "Compiló y pasaron las pruebas del esquema en el simulador."}' > "$NF_OUT/result.json"
+
+      # ------------------------------------------------------------- Evidencia
+      - name: Resumen
+        if: always()
+        shell: bash
+        run: |
+          tests=$(find "$NF_OUT/junit" -name '*.xml' -exec grep -h -o '<testsuite [^>]*' {} \; 2>/dev/null \
+            | sed -n 's/.*tests="\([0-9]*\)".*/\1/p' | paste -sd+ - | bc 2>/dev/null || echo 0)
+          failures=$(find "$NF_OUT/junit" -name '*.xml' -exec grep -h -o '<testsuite [^>]*' {} \; 2>/dev/null \
+            | sed -n 's/.*failures="\([0-9]*\)".*/\1/p' | paste -sd+ - | bc 2>/dev/null || echo 0)
+          tmp=$(mktemp)
+          jq --argjson t "${tests:-0}" --argjson f "${failures:-0}" '. + {tests: $t, failures: $f}' "$NF_OUT/result.json" > "$tmp" && mv "$tmp" "$NF_OUT/result.json"
+          {
+            echo "### Compilación y pruebas unitarias (${{ inputs.platform }})"
+            echo
+            echo "**$(jq -r '.status' "$NF_OUT/result.json")** ($(jq -r '.step' "$NF_OUT/result.json")) — $(jq -r '.message' "$NF_OUT/result.json")"
+            echo
+            echo "Pruebas JUnit: ${tests:-0}, fallidas: ${failures:-0}."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Artifact de evidencia
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nanoflow-build-check-${{ inputs.platform }}
+          path: ${{ env.NF_OUT }}
+          retention-days: 14
+          if-no-files-found: warn
