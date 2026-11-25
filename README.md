@@ -115,6 +115,7 @@ jobs:
       platform: android        # o ios, con xcode-project (y xcode-workspace)
 ```
 
+- Primero, el job `gate` (ubuntu, segundos) pregunta a NanoFlow con `{"probe": true}` si el proyecto tiene encendidas las pruebas de UI de esa plataforma (Harness del proyecto, doc 54 de la consola). Apagadas, el job `ui-tests` queda `skipped` y la corrida termina en verde: no arranca el emulador ni macOS. Si la pregunta falla, las pruebas corren. Con las pruebas apagadas, la sesión completa responde 409 `UI_TESTS_DISABLED`.
 - Pide su token OIDC y llama a `POST /v1/ci/mobile-test-session`. NanoFlow responde con:
   - las `NF_*` de development de la app;
   - el `appId`;
@@ -132,6 +133,27 @@ jobs:
 
   Antes de subirlo, quita cualquier archivo que contenga la contraseña. Es la evidencia del evaluador de NanoFlow.
 - Sin flujos en `.maestro/`, termina en verde con `no-flows`.
+
+### Compilación y pruebas unitarias de una app (`mobile-build-check.yml`)
+
+Docs 53 §9.3 y 54 de la consola. NanoFlow agrega `.github/workflows/nanoflow-build-check.yml` al conectar un repositorio `android` o `ios`. Solo corre con `workflow_dispatch`:
+
+- el runner de NanoFlow lo dispara durante el build, en la rama `nanoflow/check/<job>`: el agente no tiene SDK de Android ni Xcode y corrige en la misma sesión si no compila;
+- el ingest lo dispara antes del evaluador, en la rama del feature, cuando el proyecto apagó las pruebas de UI de esa plataforma.
+
+```yaml
+jobs:
+  build-check:
+    permissions: { contents: read }
+    uses: groupware-nanoflow/nanoflow-actions/.github/workflows/mobile-build-check.yml@v2
+    with:
+      platform: android        # o ios, con xcode-project (y xcode-workspace)
+```
+
+- Android: JDK 17, `./gradlew assembleDevelopmentDebug` y `testDevelopmentDebugUnitTest` (input `android-flavor`).
+- iOS: `xcodebuild build-for-testing` y `test-without-building` en un simulador de iPhone, sin `Config/NanoFlow.xcconfig` (la app lo incluye con `#include?`). Un esquema sin acción de pruebas solo se compila.
+- Sin `environment:`, sin secretos y sin llamar a NanoFlow.
+- Sube el artifact `nanoflow-build-check-<plataforma>` con `result.json` (`status` `passed` o `failed`, `step` `setup`, `build` o `test`, `message`, `tests` y `failures`) y los reportes JUnit en `junit/`.
 
 ### Bases Postgres (`databases`)
 

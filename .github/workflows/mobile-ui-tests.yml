@@ -12,6 +12,11 @@
 # job_workflow_ref del token OIDC sea este archivo. La contraseña se enmascara
 # y solo llega a Maestro; nunca va al artifact.
 #
+# El proyecto puede apagar las pruebas de UI de cada plataforma desde NanoFlow
+# (Harness del proyecto, doc 54 de la consola): el job gate se lo pregunta
+# antes de arrancar el emulador o macOS. Apagadas, ui-tests queda «skipped» y
+# la corrida termina en verde. Si la pregunta falla, las pruebas corren.
+#
 # El artifact nanoflow-ui-tests-<plataforma> es la evidencia del evaluador:
 # result.json (status passed | failed | no-flows | setup-failed y un mensaje),
 # report.xml (JUnit: un caso por flujo, .maestro/<idDelCriterio>.yaml) y las
@@ -58,7 +63,54 @@ on:
         default: .maestro
 
 jobs:
+  # ¿El proyecto tiene encendidas las pruebas de UI de esta plataforma? Unos
+  # segundos en ubuntu: con iOS apagado, macOS (diez veces los minutos de
+  # Linux) no llega a arrancar. Nunca falla: si NanoFlow no responde, enabled
+  # queda vacío y las pruebas corren como siempre.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      enabled: ${{ steps.probe.outputs.enabled }}
+    steps:
+      - name: ¿Pruebas de UI encendidas en NanoFlow?
+        id: probe
+        shell: bash
+        env:
+          NF_API: ${{ inputs.api-url }}
+          NF_AUDIENCE: ${{ inputs.audience }}
+          NF_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -uo pipefail
+          run_anyway() { echo "::warning::$1 Las pruebas de UI corren."; exit 0; }
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            run_anyway "Este job no tiene 'permissions: id-token: write': no puede preguntar a NanoFlow."
+          fi
+          oidc=$(curl -sS --fail-with-body --max-time 30 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${NF_AUDIENCE}" | jq -r '.value // empty')
+          [ -n "$oidc" ] || run_anyway "GitHub no devolvió un token OIDC para la audiencia ${NF_AUDIENCE}."
+          body=$(mktemp)
+          code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 -X POST "${NF_API%/}/v1/ci/mobile-test-session" \
+            -H "Authorization: Bearer ${oidc}" -H 'Content-Type: application/json' -H 'Accept: application/json' \
+            -d '{"probe":true}') || code=000
+          [ "$code" = "200" ] || run_anyway "NanoFlow no respondió la consulta (HTTP ${code}): $(jq -r '.message // "sin detalle"' "$body" 2>/dev/null || echo 'sin detalle')."
+          enabled=$(jq -r 'if .enabled == false then "false" else "true" end' "$body" 2>/dev/null || echo true)
+          echo "enabled=${enabled}" >> "$GITHUB_OUTPUT"
+          if [ "$enabled" = "false" ]; then
+            msg="Pruebas de UI de ${NF_PLATFORM} apagadas en NanoFlow (Harness del proyecto): no se corren los flujos de Maestro."
+            echo "::notice::${msg}"
+            { echo "### Pruebas de UI (${NF_PLATFORM})"; echo; echo "**apagadas** — ${msg}"; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Pruebas de UI de ${NF_PLATFORM} encendidas."
+          fi
+
   ui-tests:
+    needs: gate
+    # Solo un «false» explícito las apaga: si el gate falló, corren.
+    if: ${{ !cancelled() && needs.gate.outputs.enabled != 'false' }}
     runs-on: ${{ inputs.platform == 'ios' && 'macos-latest' || 'ubuntu-latest' }}
     timeout-minutes: 45
     permissions:
